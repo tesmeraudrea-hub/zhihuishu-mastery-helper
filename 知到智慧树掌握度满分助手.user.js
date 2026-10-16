@@ -2,8 +2,8 @@
 // @name         知到智慧树掌握度满分助手
 // @author       Watson
 // @namespace    local.zhihuishu.mastery.practice
-// @version      1.7.0
-// @description  仅用于智慧树掌握度练习：自动选择、提交并按批改重答至全对，仅跳过免考和100%；可拖动面板与悬浮球，显示满分进度，按课程学习多选分布，支持TXT题库导入、宽松匹配与导出。
+// @version      1.8.0
+// @description  智慧树掌握度练习与题库完善：自动作答、按批改纠错，支持满分后复练、TXT题库导入导出、课程独立记录、拖动悬浮球及内置使用帮助。仅用于不限次数的掌握度练习。
 // @match        https://studywisdomh5.zhihuishu.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -127,6 +127,39 @@
       if (record.correct && same(record.correct, choice)) delete record.correct;
       record.wrong ||= [];
       if (!record.wrong.some(wrong => same(wrong, choice))) record.wrong.push(canonical(choice));
+    }
+  }
+  // 题库完善的进度独立于网站掌握度，持久化在当前课程中。
+  function newReview(ignoreAnswers = false, id = `${Date.now()}-${Math.random().toString(36).slice(2)}`) {
+    return { id, startedAt: new Date().toISOString(), ignoreAnswers, completed: [], items: {}, trials: {}, rounds: {}, activeCard: '', readyScope: '', finishedAt: null };
+  }
+  function questionIdentity(question) {
+    return JSON.stringify([question.type, question.title, canonical(question.options.map(option => option.token))]);
+  }
+  function reviewProgress(review, eligible) {
+    const completed = new Set(review?.completed || []).size;
+    const entries = Object.values(review?.items || {});
+    return { completed, eligible, percent: eligible ? Math.round(1000 * Math.min(completed, eligible) / eligible) / 10 : 0,
+      added: entries.filter(item => item.correct && !item.hadAnswer).length,
+      verified: entries.filter(item => item.correct && item.hadAnswer && !item.changed).length,
+      corrected: entries.filter(item => item.correct && item.changed).length,
+      unresolved: entries.filter(item => !item.correct).length };
+  }
+  function trackReview(review, question, record, choice, correct, imported = false) {
+    const identity = questionIdentity(question);
+    const item = review.items[identity] ||= { hadAnswer: Boolean(record.correct?.length), changed: false, correct: false };
+    if (!correct && (imported || record.correct && same(record.correct, choice))) item.changed = true;
+    item.correct = correct;
+    if (review.ignoreAnswers) remember(review.trials[identity] ||= { wrong: [] }, choice, correct);
+  }
+  function reconcileFeedback(records, question, choice, correct) {
+    // 同课程完全相同的题跨知识点出现时，以新批改修正旧记录；不模糊覆盖题库。
+    const identity = questionIdentity(question);
+    for (const [key, record] of Object.entries(records)) {
+      let parts; try { parts = JSON.parse(key); } catch { continue; }
+      if (!Array.isArray(parts) || !Array.isArray(parts[3])) continue;
+      if (JSON.stringify(parts.slice(1)) !== identity) continue;
+      remember(record, choice, correct);
     }
   }
   function masteryURL(currentURL) {
@@ -424,7 +457,7 @@
     return [...new Map(matches.sort((a, b) => b.score - a.score).map(item => [JSON.stringify(item.choice), item.choice])).values()];
   }
   if (typeof module === 'object' && module.exports) {
-    module.exports = { normalize, same, combinations, questionKey, nextAnswer, remember, masteryURL, identifyPage, binomial, answerModel, rankedCombinations, masteryProgress, parseMasteryRate, snapshotQuestion, questionBankFromRecords, formatTextBank, formatExcludedBankReport, extractCourseName, courseFileName, recordsForCourse, parseTextBank, parseJSONBank, parseBankFile, mergeImported, importedCandidates, textSimilarity };
+    module.exports = { normalize, same, combinations, questionKey, nextAnswer, remember, masteryURL, identifyPage, binomial, answerModel, rankedCombinations, masteryProgress, parseMasteryRate, snapshotQuestion, questionBankFromRecords, formatTextBank, formatExcludedBankReport, extractCourseName, courseFileName, recordsForCourse, parseTextBank, parseJSONBank, parseBankFile, mergeImported, importedCandidates, textSimilarity, newReview, questionIdentity, reviewProgress, trackReview, reconcileFeedback };
     return;
   }
 
@@ -444,10 +477,11 @@
     submit: '.exam .header .submit', retry: '.exam-preview .header .submit',
     pointAnalysis: '.point .line1-count-link',
   };
-  let settings = Object.assign({ mode: 'all', delay: 250, maxRounds: 4096, importMatch: 'loose' }, GM_getValue(SETTINGS, {}));
+  let settings = Object.assign({ mode: 'all', activity: 'practice', ignoreAnswers: false, delay: 250, maxRounds: 4096, importMatch: 'loose' }, GM_getValue(SETTINGS, {}));
+  if (!['practice', 'bank'].includes(settings.activity)) settings.activity = 'practice';
   if (!['loose', 'strict'].includes(settings.importMatch)) settings.importMatch = 'loose';
   delete settings.includeGreen;
-  let db, dbCourse = '', running = false, starting = false, busy = false, generation = 0, releaseLock;
+  let db, dbCourse = '', running = false, starting = false, busy = false, navigating = false, generation = 0, releaseLock;
   let runCourse = '', lastRoute = '', routeSince = Date.now(), routeReady = false;
   let status = '待启动', logs = [], activeName = '', selectedCard = '';
   let checks, checksCourse = '';
@@ -458,6 +492,9 @@
   const courseLogs = {};
   let stagedImport = null, importBusy = false, importClearCourse = '', candidateSignature = '';
   const candidateCache = new Map();
+  let currentTab = 'practice', previousTab = 'practice', bankSummarySignature = '', resetReviewRequested = false;
+  const improving = () => settings.activity === 'bank';
+  const coldReview = () => improving() && db?.review?.ignoreAnswers === true;
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -523,7 +560,7 @@
         name = candidates.length ? extractCourseName(candidates[0]) : '';
       }
       const course = registerCourse(id, name);
-      if (JSON.stringify(db.course) !== JSON.stringify(course)) { db.course = course; save(); }
+      if (JSON.stringify(db.course) !== JSON.stringify(course)) { db.course = course; if (running) save(); }
     }
     const courses = GM_getValue(COURSES, {});
     const current = courses[id] || { id, name: '' };
@@ -560,6 +597,7 @@
     GM_setValue(PREFIX + dbCourse, db);
   }
   function preferredFor(question) {
+    if (coldReview()) return [];
     const signature = JSON.stringify([dbCourse, db.importRevision || 0, settings.importMatch]);
     if (candidateSignature !== signature) { candidateSignature = signature; candidateCache.clear(); }
     const key = questionKey(scope(), question);
@@ -571,6 +609,13 @@
     const id = uiExportCourse.value || courseId();
     const records = id ? GM_getValue(PREFIX + id, null) : null;
     $('#import-summary', ui).textContent = `所选课程导入候选：${records?.imported?.length || 0} 题。导入答案经网站判对后才进入正式题库。`;
+    const signature = JSON.stringify([id, records?.questions, records?.importRevision]);
+    if (signature !== bankSummarySignature) {
+      bankSummarySignature = signature;
+      const bank = formatTextBank(questionBankFromRecords(records?.questions || {}));
+      $('#bank-count', ui).textContent = bank.exported;
+      $('#bank-quality', ui).textContent = `待确认 ${bank.unconfirmed} · 数据不完整 ${bank.incomplete} · 答案冲突 ${bank.conflicts} 组`;
+    }
   }
   async function previewBankFile(file) {
     if (running || starting || busy || importBusy) { log('请先暂停，待当前操作结束后再导入题库'); return; }
@@ -648,20 +693,49 @@
     loadMasteryChecks(courseId()).entries[key] = { rate, color };
     saveMasteryChecks();
   }
-  function currentModel() { return answerModel(db.questions); }
+  function currentModel() {
+    if (!coldReview()) return answerModel(db.questions);
+    const trials = Object.fromEntries(Object.entries(db.review.trials).map(([identity, record]) => {
+      const parts = JSON.parse(identity);
+      return [JSON.stringify(['review', ...parts]), { ...record, type: parts[0] }];
+    }));
+    return answerModel(trials);
+  }
+  function answerRecord(question, record) {
+    return coldReview() ? (db.review.trials[questionIdentity(question)] ||= { wrong: [] }) : record;
+  }
   function refreshProgress() {
     if (!ui || !courseId()) return;
     try {
       loadDB(courseId());
+      // 暂停页只读取最新快照，不用旧内存记录覆盖其他标签页的运行成果。
+      if (!running && !starting && !busy && !importBusy) {
+        const latest = GM_getValue(PREFIX + dbCourse, null);
+        if (latest?.version === 1 && latest.questions && latest.rounds) db = latest;
+      }
       refreshCourses();
       const cards = $$(SELECTORS.cards);
       if (cards.length) {
         const colors = cards.map(cardColor);
         const snapshot = masteryProgress(colors, cards.map(checkedRate));
-        if (JSON.stringify(db.progress) !== JSON.stringify(snapshot)) { db.progress = snapshot; save(); }
+        if (JSON.stringify(db.progress) !== JSON.stringify(snapshot)) { db.progress = snapshot; if (running) save(); }
       }
-      const progress = db.progress?.perfect !== undefined ? db.progress : null;
+      let progress = db.progress?.perfect !== undefined ? db.progress : null;
+      $('#progress-title', ui).textContent = improving() ? '本轮已完成复练' : '已确认满分';
+      $('#review-stats', ui).hidden = !improving();
+      $('#new-review', ui).hidden = !improving();
+      if (improving()) {
+        const review = db.review;
+        const stats = reviewProgress(review, progress?.eligible || 0);
+        $('#review-added', ui).textContent = stats.added;
+        $('#review-verified', ui).textContent = stats.verified;
+        $('#review-corrected', ui).textContent = stats.corrected;
+        $('#review-unresolved', ui).textContent = stats.unresolved;
+        progress = progress ? { ...progress, perfect: stats.completed, percent: stats.percent, remaining: Math.max(0, stats.eligible - stats.completed), unchecked: 0 } : null;
+        $('#review-note', ui).textContent = !review ? '尚未开始。即使已满分，也会实际答题一轮。' : review.finishedAt ? '本轮已结束。可导出题库，或开始新一轮继续收集。' : `本轮始于 ${new Date(review.startedAt).toLocaleString('zh-CN')}，暂停或刷新后继续。${review.ignoreAnswers ? '正在忽略运行前已有答案。' : ''}`;
+      }
       uiProgress.textContent = progress ? `免考 ${progress.exempt} · 剩余 ${progress.remaining} · 尚待核实 ${progress.unchecked}${cards.length ? '' : '\n最近一次热力图核实结果'}` : '等待热力图核实掌握度';
+      if (improving() && progress) uiProgress.textContent = `免考 ${progress.exempt} · 本轮剩余 ${progress.remaining} · 每个知识点答至全对`;
       $('#completed-count', ui).textContent = progress ? progress.perfect : '—';
       $('#total-count', ui).textContent = progress ? progress.eligible : '—';
       $('#progress-percent', ui).textContent = progress ? `${progress.percent}%` : '—';
@@ -685,11 +759,22 @@
     uiPanel.dataset.state = uiOrb.dataset.state = state;
     $('#run-state', ui).textContent = stateLabel;
     uiStatus.textContent = `${status}${activeName ? '\n' + activeName : ''}`;
+    $('#bank-status', ui).textContent = status;
     uiStatus.title = uiStatus.textContent;
     uiOrb.setAttribute('aria-label', `展开掌握度满分助手，${stateLabel}`);
     uiStart.textContent = running || starting ? '暂停' : '开始 / 继续';
     uiStart.disabled = importBusy;
-    uiMode.disabled = running || starting;
+    uiMode.disabled = running || starting || improving();
+    $('#activity', ui).disabled = running || starting || busy || importBusy;
+    $('#ignore-answers', ui).disabled = running || starting || busy;
+    uiMode.value = improving() ? 'all' : settings.mode;
+    uiMode.options[0].textContent = improving() ? '全部非免考知识点（包括已满分）' : '全部知识点：仅跳过免考和100%';
+    $('#new-review', ui).disabled = running || starting || busy || importBusy;
+    $('#review-reset-confirm', ui).disabled = running || starting || busy || importBusy;
+    $('#cold-setting', ui).hidden = !improving();
+    $('#mode-hint', ui).textContent = improving() ? '忽略网站已有满分，复核答案并补充新题。遍历一轮后停止。' : '跳过免考和已确认 100% 的知识点，其余答至全对。';
+    $('#help-context', ui).textContent = improving() ? '当前：题库完善。每个非免考知识点实际答至全对，本轮完成后停止；不会以旧满分结果代替复核。' : '当前：满分练习。核实掌握度，仅跳过免考与 100%。制作更完整的题库可切换到“题库完善”。';
+    $('.control-hint', ui).textContent = `${stateLabel} · ${improving() ? '题库完善' : '满分练习'} · 收起后继续运行`;
     for (const id of ['import-bank', 'import-clear', 'import-match']) $('#' + id, ui).disabled = running || starting || importBusy;
     $('#import-confirm', ui).disabled = running || starting || importBusy || !stagedImport?.parsed.items.length;
     $('#import-report', ui).disabled = importBusy || !stagedImport?.parsed.excluded.length;
@@ -708,10 +793,23 @@
     render();
   }
   function stop(reason = '已手动暂停') {
+    navigating = false;
     running = false; starting = false; generation++;
     sessionStorage.removeItem(SESSION);
     if (releaseLock) { releaseLock(); releaseLock = null; }
     log(reason);
+  }
+  function saveRun() {
+    sessionStorage.setItem(SESSION, JSON.stringify({ course: runCourse, activity: settings.activity, mode: settings.mode }));
+  }
+  function goHome(target) {
+    // 完整导航期间旧页面停止调度，不用旧页面超时清除新页面的续跑标记。
+    navigating = true;
+    const attempt = generation;
+    location.assign(target);
+    setTimeout(() => {
+      if (navigating && running && generation === attempt) log('正在等待热力图载入；若页面仍未变化，请刷新，或暂停后重试');
+    }, 25000);
   }
   function challenge() {
     return $$('iframe[src*="captcha"], iframe[src*="turing.captcha"], .yidun_popup, .geetest_panel, .tcaptcha-transform, [id*="captcha"][role="dialog"]')
@@ -766,19 +864,23 @@
     guard(ctx);
     const target = masteryURL(ctx.url);
     if (selectedCard) recordMasteryRate(selectedCard, 100, 'green');
+    if (improving()) {
+      const card = db.review.activeCard || selectedCard;
+      if (!card) throw new Error('本轮知识点身份缺失，请回到热力图后继续');
+      if (!db.review.completed.includes(card)) db.review.completed.push(card);
+      db.review.activeCard = ''; db.review.readyScope = '';
+    }
     save();
-    if (settings.mode === 'current') {
+    if (!improving() && settings.mode === 'current') {
       stop('当前知识点已全部答对，返回热力图并停止');
       location.assign(target);
       return;
     }
     // 完整加载热力图，绕过解析页关闭按钮和结果页失效的返回按钮。
     // GM 记录已保存；同一标签页的 sessionStorage 让新页面自动继续。
-    sessionStorage.setItem(SESSION, JSON.stringify({ course: runCourse }));
+    saveRun();
     log(`${activeName} 本轮全部答对，直接跳转热力图继续下一项`);
-    location.assign(target);
-    // 若浏览器未完成导航，仍按既有超时机制暂停，避免反复发起跳转。
-    await waitFor(() => location.href === target && page() === 'mastery', ctx, 25000, true);
+    goHome(target);
   }
   function mediaKey(el) {
     return $$('img', el).map(img => img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('alt') || '').join('|');
@@ -819,13 +921,15 @@
     if (cards.length !== quiz.length) throw new Error('题目数量与答题卡不一致，暂停等待页面完整加载');
     activeName = textOf($('.exam .nodename'));
     const knowledge = scope();
-    if ((db.rounds[knowledge] || 0) >= settings.maxRounds) throw new Error(`此知识点已达到 ${settings.maxRounds} 轮，请检查记录后调整上限`);
+    const rounds = improving() ? db.review.rounds : db.rounds;
+    if ((rounds[knowledge] || 0) >= settings.maxRounds) throw new Error(`此知识点已达到 ${settings.maxRounds} 轮，请检查记录后调整上限`);
     const model = currentModel();
     const plan = quiz.map(q => {
       const { key, record } = recordFor(q);
       const preferred = preferredFor(q);
-      const choice = nextAnswer(record, q, model, preferred);
-      return { q, key, choice, known: Boolean(record.correct?.length), imported: preferred.some(candidate => same(candidate, choice)) };
+      const trial = answerRecord(q, record);
+      const choice = nextAnswer(trial, q, model, preferred);
+      return { q, key, choice, known: Boolean(trial.correct?.length), imported: !trial.correct?.length && preferred.some(candidate => same(candidate, choice)) };
     });
     // 填答可以中断；只有所有题目的实际 checked 状态符合计划才会提交。
     for (let index = 0; index < plan.length; index++) {
@@ -848,7 +952,7 @@
     }
     await pause(settings.delay, ctx);
     if (plan.some(({ q, choice }) => !same(selected(q), choice))) throw new Error('提交前答案被改变，请关闭其他自动答题脚本后继续');
-    db.pending = { scope: knowledge, title: activeName, entries: plan.map(({ key, choice }) => ({ key, choice })), at: Date.now() };
+    db.pending = { scope: knowledge, title: activeName, entries: plan.map(({ key, choice, imported }) => ({ key, choice, imported })), at: Date.now(), reviewId: improving() ? db.review.id : null };
     save();
     log(`本轮已作答 ${plan.length} 题，准备提交（第 ${(db.rounds[knowledge] || 0) + 1} 轮）`);
     await click($(SELECTORS.submit), ctx);
@@ -858,6 +962,7 @@
       guard(ctx, true, true);
       if (location.href !== ctx.url && ['point', 'analysis'].includes(page())) {
         db.rounds[knowledge] = (db.rounds[knowledge] || 0) + 1;
+        if (improving()) db.review.rounds[knowledge] = (db.review.rounds[knowledge] || 0) + 1;
         save();
         await pause(settings.delay, ctx, true);
         return;
@@ -877,6 +982,12 @@
     throw new Error('提交没有返回批改结果；已暂停，避免重复提交');
   }
   async function handleAnalysis(ctx) {
+    if (improving() && !db.pending) {
+      if (db.review.readyScope === scope()) await finishKnowledge(ctx);
+      else await navigateClick($(SELECTORS.retry), ctx, ['exam']);
+      return;
+    }
+    if (improving() && db.pending.reviewId !== db.review.id) throw new Error('存在上一轮未处理的答卷，请从热力图开始新一轮');
     const quiz = questions('.exam-preview .exam-item');
     activeName = textOf($('.exam-preview .nodename'));
     const outcomes = quiz.map(q => {
@@ -896,17 +1007,21 @@
         return !entry || !same(entry.choice, outcome.choice);
       })) throw new Error('批改答案与本轮提交记录不一致，请检查其他脚本或是否查看了旧记录');
     }
-    outcomes.forEach(({ record, choice, correct }) => remember(record, choice, correct));
+    outcomes.forEach(({ q, key, record, choice, correct }) => {
+      if (improving()) trackReview(db.review, q, record, choice, correct, db.pending?.entries.find(entry => entry.key === key)?.imported);
+      reconcileFeedback(db.questions, q, choice, correct);
+    });
+    const count = outcomes.filter(o => o.correct).length;
+    if (improving()) db.review.readyScope = count === outcomes.length ? scope() : '';
     db.pending = null;
     save();
-    const count = outcomes.filter(o => o.correct).length;
     log(`已记住批改结果：${count}/${outcomes.length} 正确`);
     if (count === outcomes.length) {
       await finishKnowledge(ctx);
     } else {
       // 先检查是否仍有未试组合，避免枚举耗尽后再打开一轮空答题。
       const model = currentModel();
-      outcomes.forEach(({ q, record }) => nextAnswer(record, q, model));
+      outcomes.forEach(({ q, record }) => nextAnswer(answerRecord(q, record), q, model, preferredFor(q)));
       await navigateClick($(SELECTORS.retry), ctx, ['exam']);
     }
   }
@@ -919,7 +1034,7 @@
       await navigateClick($(SELECTORS.pointAnalysis), ctx, ['analysis']);
       return;
     }
-    if (counts[1] === counts[0]) {
+    if (counts[1] === counts[0] && (!improving() || db.review.readyScope === scope())) {
       await finishKnowledge(ctx);
     } else await navigateClick($(SELECTORS.pointAnalysis), ctx, ['analysis']);
   }
@@ -952,7 +1067,7 @@
     }, ctx, 5000);
   }
   async function handleMastery(ctx) {
-    if (settings.mode === 'current') { stop('当前知识点模式：请手动进入一个知识点后继续'); return; }
+    if (!improving() && settings.mode === 'current') { stop('当前知识点模式：请手动进入一个知识点后继续'); return; }
     const cards = $$(SELECTORS.cards);
     if (!cards.length) throw new Error('热力图知识点尚未加载，请等待后继续');
     let target, targetIndex;
@@ -968,21 +1083,26 @@
         rate = parseMasteryRate(textOf($('.text > span', popover)));
         recordMasteryRate(cardIdentity(card, index), rate, color);
       }
-      if (rate !== 100 && !target) { target = card; targetIndex = index; }
+      const needed = improving() ? !db.review.completed.includes(cardIdentity(card, index)) : rate !== 100;
+      if (needed && !target) { target = card; targetIndex = index; }
     }
-    if (!target) { refreshProgress(); stop('所有非免考知识点已确认100%掌握度，任务完成'); return; }
+    if (!target) {
+      if (improving()) { db.review.finishedAt = new Date().toISOString(); save(); }
+      refreshProgress(); stop(improving() ? '本轮题库完善已完成，可导出题库；开始新一轮可继续收集新题' : '所有非免考知识点已确认100%掌握度，任务完成'); return;
+    }
     selectedCard = cardIdentity(target, targetIndex);
     activeName = textOf($(SELECTORS.cardName, target));
     log(`进入知识点：${activeName}`);
     const popover = await openPopover(target, ctx);
     const rate = parseMasteryRate(textOf($('.text > span', popover)));
     recordMasteryRate(selectedCard, rate, cardColor(target));
-    if (rate === 100) { log(`${activeName} 已100%，跳过`); return; }
+    if (!improving() && rate === 100) { log(`${activeName} 已100%，跳过`); return; }
+    if (improving()) { db.review.activeCard = selectedCard; db.review.readyScope = ''; save(); }
     const button = $$('button', popover).find(el => textOf(el) === '提升掌握度');
     await navigateClick(button, ctx, ['exam', 'point', 'analysis']);
   }
   async function step() {
-    if (!running || busy) return;
+    if (!running || busy || navigating) return;
     if (location.href !== lastRoute) { lastRoute = location.href; routeSince = Date.now(); routeReady = false; }
     if (Date.now() - routeSince < 1000) return;
     busy = true;
@@ -1028,13 +1148,23 @@
         if (!starting || attempt !== generation) return;
         if (!lock) { starting = false; log('此课程已有另一个标签页在运行，请先暂停它'); return; }
         const held = new Promise(resolve => { releaseLock = resolve; });
+        dbCourse = ''; // 持锁后读取最新课程记录，保留其他标签页暂停期间的更改。
         loadDB(runCourse);
+        if (improving()) {
+          db.review ||= newReview(settings.ignoreAnswers);
+          if (db.review.finishedAt) { starting = false; releaseLock(); log('本轮已完成，请点击“开始新一轮”继续完善题库'); return; }
+          $('#ignore-answers', ui).checked = db.review.ignoreAnswers;
+          save();
+        }
         loadMasteryChecks(runCourse);
         if (resume !== true) { checks = { version: 1, entries: {} }; saveMasteryChecks(); }
-        selectedCard = '';
+        selectedCard = improving() ? db.review.activeCard : '';
         running = true; starting = false; generation++;
         lastRoute = location.href; routeSince = Date.now(); routeReady = false;
-        sessionStorage.setItem(SESSION, JSON.stringify({ course: runCourse }));
+        saveRun();
+        if (improving() && !selectedCard && page() !== 'mastery') {
+          log('返回热力图，建立本轮知识点列表'); goHome(masteryURL(location.href));
+        }
         log(page() === 'mastery' ? '已识别热力图，开始处理下一知识点' : '已识别练习页面，逐题尝试并保存批改结果');
         await held;
       });
@@ -1045,6 +1175,39 @@
     const anchor = document.createElement('a');
     anchor.href = url; anchor.download = filename; anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+  function showTab(tab) {
+    if (tab === 'help' && currentTab !== 'help') previousTab = currentTab;
+    currentTab = tab;
+    for (const name of ['practice', 'bank', 'help']) $('#view-' + name, ui).hidden = name !== tab;
+    for (const name of ['practice', 'bank']) {
+      const button = $('#tab-' + name, ui);
+      button.setAttribute('aria-selected', String(name === tab));
+      button.tabIndex = name === tab || tab === 'help' && name === previousTab ? 0 : -1;
+    }
+    $('#help-toggle', ui).setAttribute('aria-expanded', String(tab === 'help'));
+    $('main', ui).scrollTop = 0;
+    if (floatingState) { floatingState.tab = tab; floatingState.previousTab = previousTab; saveFloatingState(); }
+  }
+  async function resetReview() {
+    if (!resetReviewRequested || running || starting || busy || importBusy || !courseId()) return;
+    if (resetReviewRequested !== courseId()) { resetReviewRequested = false; $('#review-reset', ui).hidden = true; log('课程已改变，请在当前课程重新确认新一轮'); return; }
+    const id = courseId();
+    resetReviewRequested = false;
+    if (!navigator.locks) { log('浏览器不支持运行锁'); return; }
+    importBusy = true; render();
+    let ready = false;
+    try {
+      await navigator.locks.request(PREFIX + id, { ifAvailable: true }, lock => {
+        if (!lock) throw new Error('此课程正在其他标签页运行，请先暂停');
+        if (id !== courseId()) throw new Error('课程已改变，请重新确认');
+        dbCourse = ''; loadDB(id);
+        db.review = newReview(settings.ignoreAnswers); db.pending = null; save();
+        $('#review-reset', ui).hidden = true; ready = true;
+      });
+    } catch (error) { log(`新一轮未开始：${error.message}`); }
+    finally { importBusy = false; refreshProgress(); render(); }
+    if (ready) start();
   }
   function saveFloatingState() { GM_setValue(UI_SETTINGS, floatingState); }
   function placeFloatingUI(position) {
@@ -1074,6 +1237,9 @@
     const saved = GM_getValue(UI_SETTINGS, {}) || {};
     const readPoint = point => point && Number.isFinite(point.x) && Number.isFinite(point.y) ? { x: point.x, y: point.y } : null;
     floatingState = { collapsed: saved.collapsed === true, panel: readPoint(saved.panel), orb: readPoint(saved.orb) };
+    previousTab = saved.previousTab === 'bank' ? 'bank' : 'practice';
+    currentTab = previousTab;
+    showTab(['practice', 'bank', 'help'].includes(saved.tab) ? saved.tab : 'practice');
     uiPanel.hidden = floatingState.collapsed; uiOrb.hidden = !floatingState.collapsed;
     uiOrb.setAttribute('aria-expanded', String(!floatingState.collapsed));
     placeFloatingUI();
@@ -1172,32 +1338,83 @@
       #orb{--orb-progress:0%;width:64px;height:64px;min-height:64px;border:0;border-radius:50%;padding:4px;display:grid;place-items:center;background:conic-gradient(#ad9dff var(--orb-progress),#7660df var(--orb-progress));box-shadow:0 8px 26px #6650c946,0 0 0 1px #ffffffb3;cursor:grab;touch-action:none;user-select:none;position:relative;transition:box-shadow .15s,filter .15s}
       #orb:hover{box-shadow:0 10px 32px #6650c967;filter:brightness(1.05)}#orb:active{transform:none}.orb-inner{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;width:56px;height:56px;border-radius:50%;background:linear-gradient(150deg,#8a76f5,#6651d3);color:#fff;border:1px solid #ffffff55;pointer-events:none}.orb-inner svg{width:23px;height:23px}#orb-percent{font-size:9px;font-weight:650;line-height:1.2;color:#f2eeff}.orb-dot{position:absolute;right:0;bottom:1px;width:13px;height:13px;border:3px solid #fff;border-radius:50%;background:#b7afca;pointer-events:none}#orb[data-state="running"] .orb-dot{background:#29b887}#orb[data-state="starting"] .orb-dot{background:#f0b75c}
       @media(prefers-reduced-motion:reduce){*{transition:none!important}}@media(max-height:600px){.usage-warning{font-size:10px;padding:8px 14px}.panel-header{padding:12px 14px}main{padding:12px 14px}.control-bar{padding:10px 14px}.control-hint{display:none}}
+      #help-toggle{width:30px;min-height:30px;padding:0;border-radius:50%;font-weight:750;color:#7560c5;background:#eee9ff;border:0;flex-shrink:0}#help-toggle[aria-expanded="true"]{background:#7560c5;color:white}
+      .tabs{display:flex;gap:5px;padding:9px 18px;background:#fff;border-bottom:1px solid #efecf5;flex-shrink:0}.tabs button{flex:1;border:0;min-height:33px;font-size:12px;color:#8a819b;background:transparent}.tabs button[aria-selected="true"]{background:#eee9ff;color:#6950bc;font-weight:700}
+      .quality-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.quality-grid>div{border:1px solid #eae6f4;border-radius:12px;padding:9px 3px;text-align:center;background:white}.quality-grid strong{display:block;color:#5e4a97;font-size:20px}.quality-grid span{color:#8e829e;font-size:10px}
+      .subtle{width:100%;margin:0 0 14px;color:#7560bc;background:#f6f3ff;border-style:dashed}.notice-box{margin:12px 0;padding:12px;border:1px solid #e7e2f5;background:#f6f3ff;border-radius:12px;font-size:11px;color:#766787;line-height:1.7}.notice-box p{margin:6px 0 10px}.notice-box strong{color:#5e4a83}.notice-box button{font-size:11px}
+      .bank-overview{padding:16px;border:1px solid #ddece6;background:linear-gradient(125deg,#eef9f4,#fbfffd);border-radius:16px;color:#4b806b}.bank-overview>span{font-size:11px}.bank-overview>strong{display:block;font-size:32px;line-height:1.5;letter-spacing:-1px}.bank-overview small{font-size:12px;font-weight:400}.bank-overview p{font-size:10px;margin:0;color:#6e9282}
+      .check-field{display:block;font-size:11px;color:#695c7e}.check-field input{vertical-align:middle;accent-color:#7560bc}.check-field small{display:block;font-size:10px;line-height:1.65;color:#8a8096;margin-top:5px}.help-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.help-heading small{font-size:10px;color:#9b90ad}.help-heading h2{font-size:17px;color:#4a3b64;margin:3px 0}.help-heading button{font-size:11px;min-height:32px;padding:5px 10px}
+      .help-body{padding:10px 13px;font-size:12px;color:#756881;line-height:1.85}.help-body ol{margin:0;padding-left:19px}.help-body li{margin:6px 0}.help-body p{margin:8px 0}.help-body details{margin:7px 0}.help-body details p{padding:0 11px 8px}.help-body summary{font-size:12px;padding:10px}.help-body summary:after{content:'+';margin-left:auto;color:#a695bf}.help-body details[open]>summary:after{content:'−'}.help-body pre{color:#756881;max-height:260px}#import-preview{margin:12px 0;padding:10px;background:#f6f3ff;border-radius:12px}#import-preview pre{margin-bottom:8px}
     </style>
-    <section class="panel" id="assistant-panel" role="region" aria-label="知到智慧树掌握度满分助手 v1.7.0">
+    <section class="panel" id="assistant-panel" role="region" aria-label="知到智慧树掌握度满分助手 v1.8.0">
       <header class="panel-header" id="drag-handle" title="拖动标题栏移动面板">
-        <div class="brand-mark">${bookIcon}</div><div class="identity"><h1>知到智慧树掌握度满分助手</h1><small>掌握每一个知识点 <span class="version">v1.7.0</span></small></div>
+        <div class="brand-mark">${bookIcon}</div><div class="identity"><h1>知到智慧树掌握度满分助手</h1><small>练习 · 复核 · 积累 <span class="version">v1.8.0</span></small></div>
+        <button id="help-toggle" type="button" aria-label="使用帮助" aria-controls="view-help" aria-expanded="false" title="使用帮助">?</button>
         <button id="fold" type="button" aria-label="收起为悬浮球" title="收起为悬浮球">${svg('<path d="M6 12h12"/>')}</button>
       </header>
       <aside class="usage-warning" role="note"><strong>警告：</strong>本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负<p>脚本不会自动识别课程是否限制答题次数，请在启动前自行确认。</p></aside>
+      <nav class="tabs" role="tablist" aria-label="助手功能"><button id="tab-practice" role="tab" aria-selected="true" aria-controls="view-practice">练习</button><button id="tab-bank" role="tab" aria-selected="false" aria-controls="view-bank" tabindex="-1">题库</button></nav>
       <main>
-        <div class="progress-card"><div class="progress-heading"><span>已确认满分</span><span id="progress-percent">—</span></div><div class="progress-metric"><strong id="completed-count">—</strong><span>/ <span id="total-count">—</span> 个可练习知识点</span></div><progress id="progress-bar" aria-label="可练习知识点满分进度" max="1" value="0"></progress><p id="progress"></p></div>
+        <section id="view-practice" role="tabpanel" aria-labelledby="tab-practice">
+        <div class="course-strip">${bookIcon}<p id="course-label"></p></div>
+        <label class="field"><span class="field-name">运行模式</span><select id="activity" aria-label="运行模式"><option value="practice">满分练习</option><option value="bank">题库完善</option></select></label><p class="hint" id="mode-hint"></p>
+        <div class="progress-card"><div class="progress-heading"><span id="progress-title">已确认满分</span><span id="progress-percent">—</span></div><div class="progress-metric"><strong id="completed-count">—</strong><span>/ <span id="total-count">—</span> 个可练习知识点</span></div><progress id="progress-bar" aria-label="当前运行模式进度" max="1" value="0"></progress><p id="progress"></p></div>
+        <div id="review-stats" hidden><div class="quality-grid"><div><strong id="review-added">0</strong><span>新增确认</span></div><div><strong id="review-verified">0</strong><span>复核正确</span></div><div><strong id="review-corrected">0</strong><span>纠正答案</span></div><div><strong id="review-unresolved">0</strong><span>待解决</span></div></div><p class="hint" id="review-note"></p></div>
+        <button class="subtle" id="new-review" hidden>开始新一轮</button>
+        <div class="notice-box" id="review-reset" hidden><p>重新遍历全部非免考知识点？本轮进度和未处理答卷会重置，已有题库和答题记录保留。将采用设置中的“忽略已有答案”选项。</p><div class="actions"><button id="review-reset-confirm">确认新一轮</button><button id="review-reset-cancel">取消</button></div></div>
         <div class="status-row"><span class="status-badge" id="run-state">已暂停</span><span class="status-caption">跟随页面实时反馈</span></div><p id="status" role="status" aria-live="polite"></p>
+        <details id="settings-details"><summary>运行设置<span class="chevron">${downIcon}</span></summary><div class="details-body">
         <label class="field"><span class="field-name">练习范围</span><select id="mode" aria-label="练习范围"><option value="all">全部知识点：仅跳过免考和100%</option><option value="current">当前知识点：本轮全对后停止</option></select></label>
         <label class="delay-row"><span class="field-name">操作间隔</span><span class="delay-control"><input id="delay" aria-label="操作间隔" type="number" min="0" max="10000" step="50"><span>毫秒</span></span></label>
         <p class="hint">操作间隔为选项切换、悬浮弹窗和页面更新提供响应时间，如流畅运行可尝试更低值</p>
-        <div class="course-strip">${bookIcon}<p id="course-label"></p></div>
-        <details id="export-details"><summary>${svg('<path d="M12 3v12m-4-4 4 4 4-4M5 16v5h14v-5"/>')}题库与记录<span class="chevron">${downIcon}</span></summary><div class="details-body">
-          <label class="field"><span class="field-name">导入 / 导出课程</span><select id="export-course" aria-label="导入 / 导出课程"></select></label>
           <label class="field"><span class="field-name">题库匹配方式</span><select id="import-match" aria-label="题库匹配方式"><option value="loose">宽松匹配（默认）：相似题干与选项</option><option value="strict">严格匹配：题干与全部选项一致</option></select></label>
-          <p class="hint" id="import-summary"></p>
-          <div class="actions"><button class="bank" id="import-bank">导入 TXT 题库</button><button id="import-clear">清除导入题库</button></div>
-          <div id="import-clear-preview" hidden><p class="hint" id="import-clear-text"></p><div class="actions"><button class="danger" id="import-clear-confirm">确认清除导入库</button><button id="import-clear-cancel">取消清除</button></div></div>
-          <input id="import-file" type="file" accept=".txt,.json,text/plain,application/json" hidden>
-          <p class="hint">以 TXT 为主，也支持本脚本导出的 JSON。宽松模式题干相似度至少80%，选项模糊对应至少85%；无法唯一对应时跳过。请暂停后导入。</p>
-          <div id="import-preview" hidden><pre id="import-preview-text"></pre><div class="actions"><button class="bank" id="import-confirm">确认导入</button><button id="import-cancel">取消预览</button><button id="import-report">导出无法识别清单</button></div></div>
-          <div class="actions"><button class="bank" id="export-bank">导出纯文字题库</button><button id="export">导出记录</button><button id="export-excluded">导出未入库清单</button><button class="danger" id="clear">清除当前课程记录</button></div>
+          <label class="check-field" id="cold-setting" hidden><input id="ignore-answers" type="checkbox">忽略运行前已有答案（测试猜题能力）<small>仅对新一轮题库完善生效；保留原题库，本轮仍学习实际批改。正常完善题库无需勾选。</small></label>
         </div></details>
         <details id="log-details"><summary>${svg('<path d="M5 5h14M5 12h14M5 19h8"/>')}运行记录<span id="log-count">暂无记录</span><span class="chevron">${downIcon}</span></summary><pre id="log"></pre></details>
+        </section>
+        <section id="view-bank" role="tabpanel" aria-labelledby="tab-bank" hidden>
+          <label class="field"><span class="field-name">导入 / 导出课程</span><select id="export-course" aria-label="导入 / 导出课程"></select></label>
+          <div class="bank-overview"><span>可分享的确认题库</span><strong><span id="bank-count">0</span><small> 题</small></strong><p id="bank-quality"></p></div>
+          <p class="hint" id="bank-status" role="status" aria-live="polite"></p>
+          <p class="hint" id="import-summary"></p>
+          <div class="actions"><button class="bank" id="import-bank">导入 TXT 题库</button><button class="bank" id="export-bank">导出纯文字题库</button></div>
+          <input id="import-file" type="file" accept=".txt,.json,text/plain,application/json" hidden>
+          <p class="hint">导入前先暂停。经网站判对的完整答案才能导出；导入候选不会直接混入分享文件。</p>
+          <div id="import-preview" hidden><pre id="import-preview-text"></pre><div class="actions"><button class="bank" id="import-confirm">确认导入</button><button id="import-cancel">取消预览</button><button id="import-report">导出无法识别清单</button></div></div>
+          <div class="notice-box"><strong>让题库越用越完整</strong><p>在“练习”中选择“题库完善”，复核满分知识点并收集新题。完成后分享本课程的 TXT 文件。</p><button id="help-sharing">查看制作与分享方法</button></div>
+          <details id="export-details"><summary>更多数据操作<span class="chevron">${downIcon}</span></summary><div class="details-body"><div class="actions"><button id="export">导出记录 JSON</button><button id="export-excluded">导出未入库清单</button><button id="import-clear">清除导入题库</button><button class="danger" id="clear">清除当前课程记录</button></div>
+          <div id="import-clear-preview" hidden><p class="hint" id="import-clear-text"></p><div class="actions"><button class="danger" id="import-clear-confirm">确认清除导入库</button><button id="import-clear-cancel">取消清除</button></div></div>
+          <p class="hint">JSON 导入也通过“导入 TXT 题库”选择文件。清除当前课程记录针对正在浏览的课程；清除导入题库针对上方所选课程。</p></div></details>
+        </section>
+        <section id="view-help" role="region" aria-label="使用帮助" hidden>
+          <div class="help-heading"><div><small>使用指南</small><h2>从练习到分享题库</h2></div><button id="help-back" aria-label="返回原页面">返回</button></div>
+          <p class="notice-box" id="help-context"></p>
+          <details open><summary>01　第一次使用<span class="chevron">${downIcon}</span></summary><div class="help-body"><ol><li>进入课程的掌握度热力图，确认答题次数不限。</li><li>选择“满分练习”，点击“开始 / 继续”。脚本跳过免考和已确认 100% 的知识点。</li><li>需要时点击“暂停”。收起成悬浮球仍会运行，拖动标题栏或球可以移动。</li></ol><p>“运行设置”中可调整操作间隔，默认 250 毫秒。验证码出现后脚本暂停，请手动完成验证再继续。</p></div></details>
+          <details><summary>02　使用别人的题库<span class="chevron">${downIcon}</span></summary><div class="help-body"><ol><li>暂停运行，在“题库”页选择对应课程。</li><li>点击“导入 TXT 题库”，选择文件并核对预览，再点“确认导入”。</li><li>回到“练习”开始作答。已确认答案优先，导入候选其次，最后按组合猜题。</li></ol><p>默认宽松匹配：题型一致、题干相似度至少 80%，选项模糊对应至少 85%，且对应唯一。严格匹配要求题干与全部选项内容一致。选项字母和顺序不影响匹配，可在运行设置中切换。</p><p>TXT 兼容本脚本导出的格式，也支持本脚本 JSON 记录。无法识别的条目可导出原因清单；重复导入会合并去重。</p></div></details>
+          <details id="help-make"><summary>03　制作与分享题库<span class="chevron">${downIcon}</span></summary><div class="help-body"><ol><li>打开课程热力图，选择“题库完善”。可以先导入别人分享的题库，减少猜题轮数。</li><li>点击开始。即使已满分也会实际答题，每个知识点全对后继续，本轮遍历完成便停止。</li><li>查看新增、复核、纠错和待解决统计。需要收集更多随机题时，暂停后点击“开始新一轮”。</li><li>在“题库”页选择本课程，点击“导出纯文字题库”。仅导出网站判对、内容完整且无冲突的题目。</li><li>分享 TXT 文件，并注明课程名称、学校或授课教师、导出日期和题目数量。不必分享运行记录。</li></ol><p>分享前检查内容和图片链接是否适合公开，并确认你有权分享。题库仅保存在本机，脚本不会替你上传。</p><p>若自己整理 TXT，可照下面格式写。多选答案用分号分隔，判断题用 true / false：</p><pre>1.【单选题】哪种图形有三条边？
+A.圆形
+B.三角形
+三角形
+
+2.【多选题】哪些数是偶数？
+A.2
+B.3
+C.4
+2;4
+
+3.【判断题】三角形有三条边。
+true</pre></div></details>
+          <details id="help-faq"><summary>04　常见问题<span class="chevron">${downIcon}</span></summary><div class="help-body">
+            <details><summary>为什么已经满分还会练习？</summary><p>题库完善会忽略网站已有满分，以实际提交来复核和补题。满分练习只跳过确认 100% 的项；绿色也可能只有 80% 或 90%。</p></details>
+            <details><summary>一轮结束，题库就完整了吗？</summary><p>不一定。网站可能随机抽题，一轮只覆盖本次实际出现的题目。可以开始新一轮继续收集，不会无限自动循环。</p></details>
+            <details><summary>错误题库会反复选错吗？</summary><p>不会持续沿用同一已判错组合。脚本根据网站批改撤销错误确认，排除错误候选并继续猜题。完全相同题目跨知识点的旧记录也会修正。宽松匹配仍可能增加试错次数。</p></details>
+            <details><summary>新增、复核、纠错分别是什么意思？</summary><p>按本轮实际出现的题型、题干和选项去重。新增确认表示之前没有确认答案；复核正确表示旧答案再次判对；纠正答案表示旧确认或导入候选判错后找到了正确答案。新增和纠错可能重叠。待解决表示本轮遇到但尚未判对的题目。</p></details>
+            <details><summary>刷新、更新或清除会影响数据吗？</summary><p>题库和完善轮次保存在当前浏览器的脚本存储中，刷新不清空。运行时同一标签页刷新可续跑，暂停后需手动继续。更新原脚本条目的代码保留数据；删除脚本或扩展数据可能丢失记录，请先导出。面板日志仅保留本页面最近 150 条，显示最近 12 条。</p></details>
+            <details><summary>导出为什么比导入少？</summary><p>导入答案只是候选；只有实际判对、选项完整且无冲突的题目进入 TXT。可在“更多数据操作”导出未入库清单排查。题库完善可以验证未遇到的候选，但不能保证网站抽到所有题目。</p></details>
+            <details><summary>“忽略已有答案”会删掉题库吗？</summary><p>不会。它让新一轮从猜题开始，忽略运行前已有确认、排除记录和导入候选，只学习本轮反馈；新结果仍保存。正常完善题库建议不勾选。本轮开始后固定此设置，下一轮才可更改。</p></details>
+            <details><summary>卡住、验证码或异常弹窗怎么办？</summary><p>先暂停，手动处理网站提示并检查是否有其他自动答题脚本干扰。可以调高操作间隔再继续。持续失败时保存版本、页面类型和最后提示；公开截图前遮住个人信息。</p></details>
+          </div></details>
+        </section>
       </main>
       <footer class="control-bar"><button class="primary" id="start">开始 / 继续</button><small class="control-hint">拖动标题栏移动 · 收起后继续运行</small></footer>
     </section>
@@ -1207,13 +1424,38 @@
     uiExportCourse = $('#export-course', ui); uiCourseLabel = $('#course-label', ui);
     uiPanel = $('#assistant-panel', ui); uiOrb = $('#orb', ui);
     uiMode.value = settings.mode; uiDelay.value = settings.delay;
+    $('#activity', ui).value = settings.activity;
+    $('#ignore-answers', ui).checked = settings.ignoreAnswers;
     $('#import-match', ui).value = settings.importMatch;
     setupFloatingUI();
+    $('#tab-practice', ui).onclick = () => showTab('practice');
+    $('#tab-bank', ui).onclick = () => showTab('bank');
+    $('#help-toggle', ui).onclick = () => showTab(currentTab === 'help' ? previousTab : 'help');
+    $('#help-back', ui).onclick = () => { showTab(previousTab); $('#help-toggle', ui).focus(); };
+    $('#help-sharing', ui).onclick = () => { showTab('help'); $('#help-make', ui).open = true; $('#help-make', ui).scrollIntoView({ block: 'start' }); };
+    ui.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && currentTab === 'help') { showTab(previousTab); $('#help-toggle', ui).focus(); }
+      if (event.target.getAttribute('role') === 'tab' && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault(); const name = event.key === 'Home' ? 'practice' : event.key === 'End' ? 'bank' : event.target.id === 'tab-practice' ? 'bank' : 'practice';
+        showTab(name); $('#tab-' + name, ui).focus();
+      }
+    });
+    $('#activity', ui).onchange = () => {
+      if (running || starting || busy || importBusy) return;
+      settings.activity = $('#activity', ui).value;
+      GM_setValue(SETTINGS, settings); candidateCache.clear();
+      resetReviewRequested = false; $('#review-reset', ui).hidden = true;
+      refreshProgress(); render();
+    };
+    $('#ignore-answers', ui).onchange = () => { settings.ignoreAnswers = $('#ignore-answers', ui).checked; GM_setValue(SETTINGS, settings); };
+    $('#new-review', ui).onclick = () => { resetReviewRequested = courseId(); $('#review-reset', ui).hidden = false; };
+    $('#review-reset-cancel', ui).onclick = () => { resetReviewRequested = false; $('#review-reset', ui).hidden = true; };
+    $('#review-reset-confirm', ui).onclick = resetReview;
     uiStart.onclick = () => running || starting ? stop() : start();
     const changeSettings = () => {
       const delay = Number(uiDelay.value);
       if (!uiDelay.value.trim() || !Number.isFinite(delay) || delay < 0 || delay > 10000) { uiDelay.value = settings.delay; return; }
-      settings = { ...settings, mode: uiMode.value, delay };
+      settings = { ...settings, mode: improving() ? settings.mode : uiMode.value, delay };
       GM_setValue(SETTINGS, settings);
     };
     uiMode.onchange = uiDelay.onchange = changeSettings;
@@ -1290,7 +1532,7 @@
       GM_setValue(PREFIX + dbCourse, db); candidateCache.clear();
       stagedImport = null; $('#import-preview', ui).hidden = true;
       importClearCourse = ''; $('#import-clear-preview', ui).hidden = true;
-      loadMasteryChecks(dbCourse); checks = { version: 1, entries: {} }; saveMasteryChecks(); refreshImportSummary(); log('本课程本地记录与导入题库已清除');
+      loadMasteryChecks(dbCourse); checks = { version: 1, entries: {} }; saveMasteryChecks(); refreshImportSummary(); refreshProgress(); log('本课程本地记录与导入题库已清除');
     };
     refreshProgress(); render();
   }
@@ -1303,6 +1545,11 @@
   addEventListener('pagehide', () => { if (releaseLock) releaseLock(); });
   try {
     const previous = JSON.parse(sessionStorage.getItem(SESSION) || 'null');
-    if (previous?.course === courseId()) start(true);
+    if (previous?.course === courseId()) {
+      if (['practice', 'bank'].includes(previous.activity)) settings.activity = previous.activity;
+      if (['all', 'current'].includes(previous.mode)) settings.mode = previous.mode;
+      $('#activity', ui).value = settings.activity; uiMode.value = settings.mode;
+      refreshProgress(); render(); start(true);
+    }
   } catch { sessionStorage.removeItem(SESSION); }
 })();
