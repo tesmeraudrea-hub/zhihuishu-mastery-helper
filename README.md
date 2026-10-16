@@ -160,7 +160,7 @@ true
 
 ## 下载安装
 
-前往 [GitHub Releases](https://github.com/tesmeraudrea-hub/zhihuishu-mastery-helper/releases/latest)，下载“完整脚本复制页面.html”，用浏览器打开后复制代码；也可下载 `.user.js` 脚本文件。
+前往 [GitHub Releases](https://github.com/tesmeraudrea-hub/zhihuishu-mastery-helper/releases/latest)，下载 `copy-script.html`（完整脚本复制页面），用浏览器打开后复制代码；也可下载 `.user.js` 脚本文件。
 
 ## 历史版本归档
 
