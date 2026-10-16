@@ -1,0 +1,66 @@
+[
+  {
+    "version": "1.5.2",
+    "source": "v1.5.2/zhihuishu-mastery.user.js",
+    "package": "v1.5.2/智慧树掌握度练习助手-v1.5.2-发布草稿.zip",
+    "sourceSHA256": "274db5e9750d13c2db8e434eb177449f641a34f99a39a8b63ae4a777e18bfbcb",
+    "packageSHA256": "e0343d820ac281f0f36103ef490c468c55e13f714f56fe61ef9d7d2c00bb1fee",
+    "originalFile": "智慧树掌握度练习助手-v1.5.2-发布草稿.zip"
+  },
+  {
+    "version": "1.5.3",
+    "source": "v1.5.3/zhihuishu-mastery.user.js",
+    "package": "v1.5.3/知到智慧树掌握度满分助手-v1.5.3.zip",
+    "sourceSHA256": "1799957192c81d5216186bfaebd06cd63419f3af7c1e94472cf1881cf7b73cb3",
+    "packageSHA256": "6d524aa8d0f33359d9cb64002c9c8df907d3a1ea8b668375dfac47c3e21364eb",
+    "originalFile": "知到智慧树掌握度满分助手-v1.5.3.zip"
+  },
+  {
+    "version": "1.5.4",
+    "source": "v1.5.4/zhihuishu-mastery.user.js",
+    "package": "v1.5.4/知到智慧树掌握度满分助手-v1.5.4.zip",
+    "sourceSHA256": "756ba14516cab55eb56b9a8600124a2c4cadf5c93ebffb6b89af3c7a5d50c31f",
+    "packageSHA256": "4f8ed7d17ecd5f8f0a08736ef949c1ea781224dccadf6b6c009efd3d1257d179",
+    "originalFile": "知到智慧树掌握度满分助手-v1.5.4.zip"
+  },
+  {
+    "version": "1.6.0",
+    "source": "v1.6.0/zhihuishu-mastery.user.js",
+    "package": "v1.6.0/知到智慧树掌握度满分助手-v1.6.0.zip",
+    "sourceSHA256": "fb65056faa608b508e0ad4ef38927df4863aa5e8e31100023bd4dd18d6a8a1cf",
+    "packageSHA256": "bd9a2092c655720c7f22090d83890a6ef371d3a2db1a4e210ad9415bf0842b3b",
+    "originalFile": "知到智慧树掌握度满分助手-v1.6.0.zip"
+  },
+  {
+    "version": "1.6.1",
+    "source": "v1.6.1/zhihuishu-mastery.user.js",
+    "package": "v1.6.1/知到智慧树掌握度满分助手-v1.6.1.zip",
+    "sourceSHA256": "f262131aef9cb88f90310c7a01963eac5ea527592cec5b2f071a44f3a3e04e2b",
+    "packageSHA256": "7a32131e7c0dd63b6d596e833f95727509272dbd6eaf36cd3d973a785a1f77c5",
+    "originalFile": "知到智慧树掌握度满分助手-v1.6.1.zip"
+  },
+  {
+    "version": "1.7.0",
+    "source": "v1.7.0/zhihuishu-mastery.user.js",
+    "package": "v1.7.0/知到智慧树掌握度满分助手-v1.7.0.zip",
+    "sourceSHA256": "75052f089d266855533d515f638dc8952d51768034b4f64a1551a3696ff5bec6",
+    "packageSHA256": "d50f03714c25ddddd3d34be1fe79caefc1b1644c7124ca6ee256a70d1cba5f2e",
+    "originalFile": "知到智慧树掌握度满分助手-v1.7.0.zip"
+  },
+  {
+    "version": "1.8.0",
+    "source": "v1.8.0/zhihuishu-mastery.user.js",
+    "package": "v1.8.0/知到智慧树掌握度满分助手-v1.8.0.zip",
+    "sourceSHA256": "2f10601f5d5bfde2d595b02fd30e9340f464921c98efa6c5ce828fe0fb0cacdf",
+    "packageSHA256": "58665dad4ebe3bb283563a610bffaeb9728581cd76eab720f1992ae3ef1b940d",
+    "originalFile": "知到智慧树掌握度满分助手-v1.8.0.zip"
+  },
+  {
+    "version": "1.8.1",
+    "source": "v1.8.1/zhihuishu-mastery.user.js",
+    "package": "v1.8.1/知到智慧树掌握度满分助手-v1.8.1.zip",
+    "sourceSHA256": "b87723a20a6cb03f991008d511d9478494e17e633e3dfe27be317c173f000c20",
+    "packageSHA256": "000c319c23343cdd476160a641186896433ccd4f52880bf36e33e51bbbd18cb3",
+    "originalFile": "知到智慧树掌握度满分助手-v1.8.1.zip"
+  }
+]

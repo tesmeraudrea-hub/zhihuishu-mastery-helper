@@ -1,0 +1,2 @@
+# Keep archived releases and generated copies byte-for-byte unchanged on checkout.
+* -text

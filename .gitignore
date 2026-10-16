@@ -1,0 +1,16 @@
+# 只跟踪公开发布文件；本地题库、运行记录、测试产物和压缩包默认不上传。
+/*
+!/.gitignore
+!/zhihuishu-mastery.user.js
+!/知到智慧树掌握度满分助手.user.js
+!/知到智慧树掌握度满分助手-完整代码.txt
+!/完整脚本复制页面.html
+!/README.md
+!/LICENSE
+!/PRIVACY.md
+!/CHANGELOG.md
+!/投稿说明.md
+!/v1.8.1-发布详细说明.md
+!/archives/
+!/testing/
+!/.gitattributes
