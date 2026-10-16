@@ -17,7 +17,7 @@
 
 v1.5.2 以前只找到更新说明与测试产物，未找到可核实的完整源码或发布包。因此本仓库尚不能提供那些版本的完整安装文件，也没有按更新说明倒推重造旧代码。主要变化见根目录 [CHANGELOG.md](../CHANGELOG.md)。
 
-独立测试版目前只保留了 [v1.8.1](../testing/zhihuishu-mastery-test.user.js)，更早测试版的完整源码暂缺。
+公开仓库只提供正式版。各版本的常用下载文件见 [GitHub Releases](https://github.com/tesmeraudrea-hub/zhihuishu-mastery-helper/releases)。
 
 ## 完整性与使用
 
