@@ -2,8 +2,8 @@
 // @name         知到智慧树掌握度满分助手
 // @author       Watson
 // @namespace    local.zhihuishu.mastery.practice
-// @version      1.6.1
-// @description  仅用于智慧树掌握度练习：自动选择、提交并按批改重答至全对，仅跳过免考和100%；可拖动面板与悬浮球，显示满分进度，按课程学习多选分布并导出题库。
+// @version      1.7.0
+// @description  仅用于智慧树掌握度练习：自动选择、提交并按批改重答至全对，仅跳过免考和100%；可拖动面板与悬浮球，显示满分进度，按课程学习多选分布，支持TXT题库导入、宽松匹配与导出。
 // @match        https://studywisdomh5.zhihuishu.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -106,13 +106,15 @@
     return { total, exempt, eligible, perfect, verified, unchecked: eligible - verified,
       remaining: eligible - perfect, percent: eligible ? Math.round(1000 * perfect / eligible) / 10 : total ? 100 : 0 };
   }
-  function nextAnswer(record, question, model) {
+  function nextAnswer(record, question, model, preferred = []) {
     const candidates = rankedCombinations(question, model);
     if (record.correct?.length) {
       if (!candidates.some(choice => same(choice, record.correct))) throw new Error('已知答案与当前选项不一致');
       return record.correct;
     }
-    const choice = candidates.find(candidate => !(record.wrong || []).some(wrong => same(candidate, wrong)));
+    const candidateKeys = new Set(candidates.map(choice => JSON.stringify(canonical(choice))));
+    const eligible = preferred.filter(choice => Array.isArray(choice) && candidateKeys.has(JSON.stringify(canonical(choice))));
+    const choice = [...eligible, ...candidates].find(candidate => !(record.wrong || []).some(wrong => same(candidate, wrong)));
     if (!choice) throw new Error('所有组合均被判错，已暂停；请检查题目、批改或其他脚本干扰');
     return choice;
   }
@@ -254,8 +256,175 @@
     const rounds = Object.fromEntries(Object.entries(records.rounds || {}).filter(([key]) => key.startsWith(prefix)));
     return { ...records, questions, rounds, pending: records.pending?.scope?.startsWith(prefix) ? records.pending : null };
   }
+  // 导入题库只保存候选，网站判对后才进入 questions 中的确认答案与分布统计。
+  const matchText = value => normalize(value).toLowerCase().replace(/[\p{P}\p{Z}\s]/gu, '');
+  function truthToken(value) {
+    const text = normalize(value).toLowerCase();
+    if (/^(对|正确|是|真|true|t|√|✓|1)$/.test(text)) return 'true';
+    if (/^(错|错误|不正确|否|假|false|f|×|✗|0)$/.test(text)) return 'false';
+    return null;
+  }
+  function textSimilarity(a, b) {
+    a = matchText(a); b = matchText(b);
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    if (Math.min(a.length, b.length) < 4) return 0;
+    const grams = value => { const counts = new Map(); for (let i = 0; i < value.length - 1; i++) { const pair = value.slice(i, i + 2); counts.set(pair, (counts.get(pair) || 0) + 1); } return counts; };
+    const left = grams(a), right = grams(b);
+    let overlap = 0;
+    for (const [pair, count] of left) overlap += Math.min(count, right.get(pair) || 0);
+    return 2 * overlap / (a.length + b.length - 2);
+  }
+  function importedItem(type, title, options, answers) {
+    title = normalize(title);
+    if (!['单选题', '多选题', '判断题'].includes(type) || !title) throw new Error('题型或题干缺失');
+    options = options.map(normalize);
+    if (type === '判断题') {
+      options = options.length ? options.map(option => truthToken(option) || option) : ['true', 'false'];
+      answers = answers.map(answer => answer.map(option => truthToken(option) || normalize(option)));
+    } else answers = answers.map(answer => answer.map(normalize));
+    if (!options.length || options.length > 12 || options.some(option => !option) || new Set(options).size !== options.length) throw new Error('选项缺失、重复或超过12项');
+    if (!answers.length || answers.some(answer => !answer.length || (type !== '多选题' && answer.length !== 1) || new Set(answer).size !== answer.length || !answer.every(value => options.includes(value)))) throw new Error('答案缺失或不能唯一对应选项');
+    const unique = [...new Map(answers.map(answer => [JSON.stringify(canonical(answer)), canonical(answer)])).values()];
+    return { type, title, options, answers: unique };
+  }
+  function parseTextBank(text) {
+    const lines = String(text).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+    const blocks = []; let block;
+    for (const raw of lines) {
+      const line = raw.trim();
+      const typed = line.match(/^(?:\d{1,6}\s*[.、．)）]\s*)?[【\[(（]\s*(单选题?|多选题?|判断题?)\s*[】\])）]\s*(.*)$/);
+      const numbered = !typed && line.match(/^\d{1,6}\s*[.、．]\s*(?!\d)(.+)$/);
+      if (typed || numbered) {
+        if (blocks.length >= 20000) throw new Error('单次最多识别20000道题，请拆分题库');
+        block = { type: typed ? typed[1].replace(/题?$/, '题') : '', lines: [typed ? typed[2] : numbered[1]], number: blocks.length + 1 };
+        blocks.push(block);
+      } else if (block && line) block.lines.push(line);
+    }
+    const items = [], excluded = [];
+    for (const entry of blocks) {
+      try {
+        let body = [...entry.lines], answer = '';
+        const explicit = body.findIndex(line => /^(?:参考答案|正确答案|答案)\s*[:：]/.test(line));
+        if (explicit >= 0) { answer = body[explicit].replace(/^(?:参考答案|正确答案|答案)\s*[:：]\s*/, ''); body = body.slice(0, explicit); }
+        const optionPattern = /^([A-La-l])\s*[.、．:：)）]\s*(.*)$/;
+        const optionStart = body.findIndex(line => optionPattern.test(line));
+        let title, options = [], labels = [];
+        if (optionStart >= 0) {
+          title = body.slice(0, optionStart).join(' ');
+          if (!answer) {
+            if (optionPattern.test(body.at(-1))) throw new Error('没有答案行');
+            answer = body.pop();
+          }
+          for (const line of body.slice(optionStart)) {
+            const option = line.match(optionPattern);
+            if (option) { labels.push(option[1].toUpperCase()); options.push(option[2]); }
+            else options[options.length - 1] += ' ' + line;
+          }
+          if (new Set(labels).size !== labels.length) throw new Error('选项字母重复');
+        } else {
+          if (!answer) answer = body.pop();
+          title = body.join(' ');
+        }
+        answer = normalize(answer);
+        let choice;
+        const exact = options.filter(option => normalize(option) === answer);
+        if (exact.length === 1) choice = exact;
+        else if (labels.length && /^[A-La-l\s,，;；、|]+$/.test(answer)) {
+          const letters = answer.toUpperCase().replace(/[\s,，;；、|]/g, '').split('');
+          if (!letters.every(letter => labels.includes(letter))) throw new Error('答案字母不在选项中');
+          choice = letters.map(letter => options[labels.indexOf(letter)]);
+        } else choice = answer.split(/[;；]/).map(normalize);
+        // 兼容常见逗号分隔，但仅在每一段都能对应选项时拆分。
+        if (choice.length === 1 && !exact.length && /[,，、|]/.test(answer)) {
+          const parts = answer.split(/[,，、|]/).map(normalize);
+          if (parts.every(part => options.some(option => normalize(option) === part))) choice = parts;
+        }
+        const type = entry.type || (!options.length && truthToken(answer) ? '判断题' : choice.length > 1 ? '多选题' : '单选题');
+        items.push(importedItem(type, title, options, [choice]));
+      } catch (error) { excluded.push({ number: entry.number, title: entry.lines[0] || '', reason: error.message }); }
+    }
+    if (!blocks.length) throw new Error('未识别到题目。请使用“1.【单选题】题干”或“1.题干”开头，每个选项和答案各占一行');
+    return { items, excluded, detected: blocks.length };
+  }
+  function parseJSONBank(text) {
+    const data = JSON.parse(String(text).replace(/^\uFEFF/, ''));
+    const records = data?.records?.questions || data?.questions;
+    if (!records || typeof records !== 'object' || Array.isArray(records)) throw new Error('JSON不是本脚本导出的记录或题库格式');
+    const entries = Object.entries(records);
+    if (entries.length > 20000) throw new Error('单次最多识别20000道题，请拆分题库');
+    const items = [], excluded = [];
+    for (const [key, record] of entries) {
+      try {
+        if (!record || typeof record !== 'object') throw new Error('题目记录无效');
+        let parts; try { parts = JSON.parse(key); } catch { parts = []; }
+        const sourceOptions = record.latestOptions || record.options || parts?.[3] || [];
+        const options = sourceOptions.map(option => typeof option === 'string' ? { token: option, content: option } : option);
+        const tokens = record.correctAnswerTokens || record.correct;
+        if (!Array.isArray(tokens) || !tokens.length) throw new Error('没有已确认答案');
+        const choice = tokens.map(token => {
+          const matches = options.filter(option => option?.token === token);
+          if (matches.length !== 1) throw new Error('答案与选项不一致');
+          return matches[0].content ?? matches[0].token;
+        });
+        items.push(importedItem(record.type || parts?.[1], record.title || parts?.[2], options.map(option => option?.content ?? option?.token), [choice]));
+      } catch (error) { excluded.push({ number: excluded.length + items.length + 1, title: record?.title || '', reason: error.message }); }
+    }
+    return { items, excluded, detected: entries.length };
+  }
+  function parseBankFile(text, filename = '') {
+    return /\.json$/i.test(filename) || /^[\s\uFEFF]*\{/.test(text) ? parseJSONBank(text) : parseTextBank(text);
+  }
+  function mergeImported(existing, incoming) {
+    const map = new Map(); let added = 0, duplicates = 0, addedAnswers = 0;
+    for (const [batch, items] of [existing || [], incoming].entries()) {
+      for (const raw of items) {
+        const item = importedItem(raw.type, raw.title, raw.options, raw.answers);
+        const key = JSON.stringify([item.type, item.title, canonical(item.options)]);
+        if (!map.has(key)) { map.set(key, { ...item, answers: [] }); if (batch === 1) added++; }
+        const target = map.get(key);
+        for (const answer of item.answers) {
+          if (target.answers.some(previous => same(previous, answer))) { if (batch === 1) duplicates++; }
+          else { target.answers.push(answer); if (batch === 1) addedAnswers++; }
+        }
+      }
+    }
+    if (map.size > 20000) throw new Error('合并后超过20000道题，请分到不同课程或先清除导入题库');
+    const items = [...map.values()];
+    return { items, added, addedAnswers, duplicates, conflicts: items.filter(item => item.answers.length > 1).length };
+  }
+  function importedCandidates(items, question, mode = 'loose') {
+    const live = question.options.map(option => ({ token: option.token, text: question.type === '判断题' ? truthToken(option.content ?? option.token) || normalize(option.content ?? option.token) : normalize(option.content ?? option.token) }));
+    const matches = [];
+    for (const item of items || []) {
+      if (item.type !== question.type) continue;
+      let score;
+      if (mode === 'strict') {
+        if (normalize(item.title) !== normalize(question.title) || !same(item.options.map(normalize), live.map(option => option.text))) continue;
+        score = 2;
+      } else {
+        if (/\[图片:/.test(item.title + question.title) && normalize(item.title) !== normalize(question.title)) continue;
+        score = textSimilarity(item.title, question.title);
+        if (score < 0.8) continue;
+      }
+      for (const answer of item.answers) {
+        const mapped = []; let valid = true;
+        for (const value of answer) {
+          let options = live.filter(option => mode === 'strict' || /\[图片:/.test(value + option.text) ? option.text === normalize(value) : matchText(option.text) === matchText(value));
+          if (!options.length && mode !== 'strict' && !/\[图片:/.test(value)) {
+            const ranked = live.filter(option => !/\[图片:/.test(option.text)).map(option => ({ option, similarity: textSimilarity(value, option.text) })).sort((a, b) => b.similarity - a.similarity);
+            if (ranked[0]?.similarity >= 0.85 && ranked[0].similarity - (ranked[1]?.similarity || 0) >= 0.08) options = [ranked[0].option];
+          }
+          if (options.length !== 1) { valid = false; break; }
+          mapped.push(options[0].token);
+        }
+        if (valid && new Set(mapped).size === mapped.length && (question.multiple || mapped.length === 1)) matches.push({ choice: canonical(mapped), score });
+      }
+    }
+    return [...new Map(matches.sort((a, b) => b.score - a.score).map(item => [JSON.stringify(item.choice), item.choice])).values()];
+  }
   if (typeof module === 'object' && module.exports) {
-    module.exports = { normalize, same, combinations, questionKey, nextAnswer, remember, masteryURL, identifyPage, binomial, answerModel, rankedCombinations, masteryProgress, parseMasteryRate, snapshotQuestion, questionBankFromRecords, formatTextBank, formatExcludedBankReport, extractCourseName, courseFileName, recordsForCourse };
+    module.exports = { normalize, same, combinations, questionKey, nextAnswer, remember, masteryURL, identifyPage, binomial, answerModel, rankedCombinations, masteryProgress, parseMasteryRate, snapshotQuestion, questionBankFromRecords, formatTextBank, formatExcludedBankReport, extractCourseName, courseFileName, recordsForCourse, parseTextBank, parseJSONBank, parseBankFile, mergeImported, importedCandidates, textSimilarity };
     return;
   }
 
@@ -275,7 +444,8 @@
     submit: '.exam .header .submit', retry: '.exam-preview .header .submit',
     pointAnalysis: '.point .line1-count-link',
   };
-  let settings = Object.assign({ mode: 'all', delay: 250, maxRounds: 4096 }, GM_getValue(SETTINGS, {}));
+  let settings = Object.assign({ mode: 'all', delay: 250, maxRounds: 4096, importMatch: 'loose' }, GM_getValue(SETTINGS, {}));
+  if (!['loose', 'strict'].includes(settings.importMatch)) settings.importMatch = 'loose';
   delete settings.includeGreen;
   let db, dbCourse = '', running = false, starting = false, busy = false, generation = 0, releaseLock;
   let runCourse = '', lastRoute = '', routeSince = Date.now(), routeReady = false;
@@ -286,6 +456,8 @@
   let floatingState, uiPanel, uiOrb, dragSession = null;
   let metadataRoute = '', metadataSince = Date.now();
   const courseLogs = {};
+  let stagedImport = null, importBusy = false, importClearCourse = '', candidateSignature = '';
+  const candidateCache = new Map();
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -370,6 +542,7 @@
       if (courses[selected]) uiExportCourse.value = selected;
       lastExportPageCourse = id; courseOptionSignature = signature;
     }
+    refreshImportSummary();
   }
   function exportSource() {
     const id = uiExportCourse.value || courseId();
@@ -380,7 +553,84 @@
     const course = GM_getValue(COURSES, {})[id] || { id, name: '' };
     return { course, records: recordsForCourse(records, id) };
   }
-  function save() { GM_setValue(PREFIX + dbCourse, db); }
+  function save() {
+    // 暂停的其他页面可能导入题库，避免旧页面的普通进度保存覆盖最新导入项。
+    const latest = GM_getValue(PREFIX + dbCourse, null);
+    if (latest?.imported) { db.imported = latest.imported; db.importRevision = latest.importRevision; }
+    GM_setValue(PREFIX + dbCourse, db);
+  }
+  function preferredFor(question) {
+    const signature = JSON.stringify([dbCourse, db.importRevision || 0, settings.importMatch]);
+    if (candidateSignature !== signature) { candidateSignature = signature; candidateCache.clear(); }
+    const key = questionKey(scope(), question);
+    if (!candidateCache.has(key)) candidateCache.set(key, importedCandidates(db.imported, question, settings.importMatch));
+    return candidateCache.get(key);
+  }
+  function refreshImportSummary() {
+    if (!ui) return;
+    const id = uiExportCourse.value || courseId();
+    const records = id ? GM_getValue(PREFIX + id, null) : null;
+    $('#import-summary', ui).textContent = `所选课程导入候选：${records?.imported?.length || 0} 题。导入答案经网站判对后才进入正式题库。`;
+  }
+  async function previewBankFile(file) {
+    if (running || starting || busy || importBusy) { log('请先暂停，待当前操作结束后再导入题库'); return; }
+    const id = uiExportCourse.value || courseId();
+    if (!id) { log('请先打开课程，再选择导入目标'); return; }
+    stagedImport = null;
+    $('#import-preview', ui).hidden = true;
+    importBusy = true; render();
+    try {
+      if (file.size > 20 * 1024 * 1024) throw new Error('题库文件超过20 MB，请拆分后导入');
+      const buffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let text;
+      if (bytes[0] === 0xff && bytes[1] === 0xfe) text = new TextDecoder('utf-16le', { fatal: true }).decode(buffer);
+      else if (bytes[0] === 0xfe && bytes[1] === 0xff) text = new TextDecoder('utf-16be', { fatal: true }).decode(buffer);
+      else {
+        try { text = new TextDecoder('utf-8', { fatal: true }).decode(buffer); }
+        catch { text = new TextDecoder('gb18030', { fatal: true }).decode(buffer); }
+      }
+      const parsed = parseBankFile(text, file.name);
+      if ((uiExportCourse.value || courseId()) !== id) throw new Error('目标课程已改变，请重新选择题库文件');
+      const records = GM_getValue(PREFIX + id, { version: 1, questions: {}, rounds: {}, pending: null });
+      const merged = mergeImported(records.imported, parsed.items);
+      const course = GM_getValue(COURSES, {})[id] || { id, name: '' };
+      stagedImport = { id, parsed, filename: file.name };
+      $('#import-preview-text', ui).textContent = `目标课程：${course.name || id}\n文件：${file.name}\n识别 ${parsed.detected} 题，可用 ${parsed.items.length} 题，无法识别 ${parsed.excluded.length} 题\n新增 ${merged.added} 题 / ${merged.addedAnswers} 个候选答案，重复答案 ${merged.duplicates} 个，合并后冲突 ${merged.conflicts} 组\n\n` + parsed.items.slice(0, 3).map((item, index) => `${index + 1}.【${item.type}】${item.title}\n候选：${item.answers.map(answer => answer.join(';')).join(' / ')}`).join('\n\n');
+      $('#import-preview', ui).hidden = false;
+      $('#import-confirm', ui).disabled = !parsed.items.length;
+      $('#import-report', ui).disabled = !parsed.excluded.length;
+      log(`题库预览已准备：可用 ${parsed.items.length} 题，请核对目标课程后确认导入`);
+    } catch (error) { log(`读取题库失败：${error.message}`); }
+    finally { importBusy = false; render(); }
+  }
+  async function changeImportedBank(clear = false) {
+    if (running || starting || busy || importBusy) { log('请先暂停，待当前操作结束后再修改导入题库'); return; }
+    const id = uiExportCourse.value || courseId();
+    if (!id || (clear ? importClearCourse !== id : !stagedImport || stagedImport.id !== id)) { log('目标课程已改变，请重新预览或确认目标课程'); return; }
+    const course = GM_getValue(COURSES, {})[id] || { id, name: '' };
+    const incoming = clear ? [] : stagedImport.parsed.items;
+    if (!navigator.locks) { log('浏览器不支持运行锁，请使用新版 Edge / Chrome'); return; }
+    importBusy = true; render();
+    try {
+      await navigator.locks.request(PREFIX + id, { ifAvailable: true }, async lock => {
+        if (!lock) throw new Error('该课程正在其他标签页运行，请先暂停后导入');
+        const records = GM_getValue(PREFIX + id, { version: 1, questions: {}, rounds: {}, pending: null });
+        if (records.version !== 1 || !records.questions || !records.rounds) throw new Error('课程记录格式异常，请先导出检查');
+        const merged = mergeImported(clear ? [] : records.imported, incoming);
+        records.imported = merged.items;
+        records.importRevision = (Number(records.importRevision) || 0) + 1;
+        GM_setValue(PREFIX + id, records);
+        if (dbCourse === id) db = records;
+        registerCourse(id, course.name);
+        candidateCache.clear();
+        stagedImport = null; $('#import-preview', ui).hidden = true;
+        importClearCourse = ''; $('#import-clear-preview', ui).hidden = true;
+        log(clear ? `[${course.name || id}] 导入候选题库已清除，已确认答案保留` : `[${course.name || id}] 已合并导入：新增 ${merged.added} 题、${merged.addedAnswers} 个候选答案，重复 ${merged.duplicates} 个，冲突 ${merged.conflicts} 组`, id);
+      });
+    } catch (error) { log(`题库修改失败：${error.message}`); }
+    finally { importBusy = false; refreshImportSummary(); render(); }
+  }
   function loadMasteryChecks(course) {
     if (checksCourse === course && checks) return checks;
     checksCourse = course;
@@ -438,8 +688,12 @@
     uiStatus.title = uiStatus.textContent;
     uiOrb.setAttribute('aria-label', `展开掌握度满分助手，${stateLabel}`);
     uiStart.textContent = running || starting ? '暂停' : '开始 / 继续';
-    uiStart.disabled = false;
+    uiStart.disabled = importBusy;
     uiMode.disabled = running || starting;
+    for (const id of ['import-bank', 'import-clear', 'import-match']) $('#' + id, ui).disabled = running || starting || importBusy;
+    $('#import-confirm', ui).disabled = running || starting || importBusy || !stagedImport?.parsed.items.length;
+    $('#import-report', ui).disabled = importBusy || !stagedImport?.parsed.excluded.length;
+    $('#import-clear-confirm', ui).disabled = running || starting || importBusy || !importClearCourse;
     uiLog.textContent = logs.slice(-12).join('\n');
     $('#log-count', ui).textContent = logs.length ? `${Math.min(logs.length, 12)} 条` : '暂无记录';
     uiLog.scrollTop = uiLog.scrollHeight;
@@ -569,17 +823,19 @@
     const model = currentModel();
     const plan = quiz.map(q => {
       const { key, record } = recordFor(q);
-      return { q, key, choice: nextAnswer(record, q, model), known: Boolean(record.correct?.length) };
+      const preferred = preferredFor(q);
+      const choice = nextAnswer(record, q, model, preferred);
+      return { q, key, choice, known: Boolean(record.correct?.length), imported: preferred.some(candidate => same(candidate, choice)) };
     });
     // 填答可以中断；只有所有题目的实际 checked 状态符合计划才会提交。
     for (let index = 0; index < plan.length; index++) {
-      const { q, choice, known } = plan[index];
+      const { q, choice, known, imported } = plan[index];
       if (!visible(q.el)) {
         const card = cards.find(card => Number(textOf(card)) === q.number);
         await click(card, ctx);
         await waitFor(() => visible(q.el), ctx);
       }
-      log(`第 ${index + 1}/${plan.length} 题：${known ? '沿用正确答案' : '尝试'} ${answerLabel(q, choice)}`);
+      log(`第 ${index + 1}/${plan.length} 题：${known ? '沿用正确答案' : imported ? '尝试题库候选' : '尝试'} ${answerLabel(q, choice)}`);
       for (const option of q.options) {
         const want = choice.includes(option.token);
         if ((q.multiple && option.input.checked !== want) || (!q.multiple && want && !option.input.checked)) {
@@ -750,7 +1006,7 @@
     } finally { busy = false; render(); }
   }
   async function start(resume = false) {
-    if (running || starting || busy) return;
+    if (running || starting || busy || importBusy) return;
     const requestedCourse = courseId();
     if (!requestedCourse || page() === 'unknown') { log(`请打开掌握度热力图或知识点练习页面（当前路径：${location.pathname}）`); return; }
     if (!navigator.locks) { log('浏览器不支持运行锁，请使用新版 Edge / Chrome'); return; }
@@ -917,9 +1173,9 @@
       #orb:hover{box-shadow:0 10px 32px #6650c967;filter:brightness(1.05)}#orb:active{transform:none}.orb-inner{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;width:56px;height:56px;border-radius:50%;background:linear-gradient(150deg,#8a76f5,#6651d3);color:#fff;border:1px solid #ffffff55;pointer-events:none}.orb-inner svg{width:23px;height:23px}#orb-percent{font-size:9px;font-weight:650;line-height:1.2;color:#f2eeff}.orb-dot{position:absolute;right:0;bottom:1px;width:13px;height:13px;border:3px solid #fff;border-radius:50%;background:#b7afca;pointer-events:none}#orb[data-state="running"] .orb-dot{background:#29b887}#orb[data-state="starting"] .orb-dot{background:#f0b75c}
       @media(prefers-reduced-motion:reduce){*{transition:none!important}}@media(max-height:600px){.usage-warning{font-size:10px;padding:8px 14px}.panel-header{padding:12px 14px}main{padding:12px 14px}.control-bar{padding:10px 14px}.control-hint{display:none}}
     </style>
-    <section class="panel" id="assistant-panel" role="region" aria-label="知到智慧树掌握度满分助手 v1.6.1">
+    <section class="panel" id="assistant-panel" role="region" aria-label="知到智慧树掌握度满分助手 v1.7.0">
       <header class="panel-header" id="drag-handle" title="拖动标题栏移动面板">
-        <div class="brand-mark">${bookIcon}</div><div class="identity"><h1>知到智慧树掌握度满分助手</h1><small>掌握每一个知识点 <span class="version">v1.6.1</span></small></div>
+        <div class="brand-mark">${bookIcon}</div><div class="identity"><h1>知到智慧树掌握度满分助手</h1><small>掌握每一个知识点 <span class="version">v1.7.0</span></small></div>
         <button id="fold" type="button" aria-label="收起为悬浮球" title="收起为悬浮球">${svg('<path d="M6 12h12"/>')}</button>
       </header>
       <aside class="usage-warning" role="note"><strong>警告：</strong>本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负<p>脚本不会自动识别课程是否限制答题次数，请在启动前自行确认。</p></aside>
@@ -931,7 +1187,14 @@
         <p class="hint">操作间隔为选项切换、悬浮弹窗和页面更新提供响应时间，如流畅运行可尝试更低值</p>
         <div class="course-strip">${bookIcon}<p id="course-label"></p></div>
         <details id="export-details"><summary>${svg('<path d="M12 3v12m-4-4 4 4 4-4M5 16v5h14v-5"/>')}题库与记录<span class="chevron">${downIcon}</span></summary><div class="details-body">
-          <label class="field"><span class="field-name">导出课程</span><select id="export-course" aria-label="导出课程"></select></label>
+          <label class="field"><span class="field-name">导入 / 导出课程</span><select id="export-course" aria-label="导入 / 导出课程"></select></label>
+          <label class="field"><span class="field-name">题库匹配方式</span><select id="import-match" aria-label="题库匹配方式"><option value="loose">宽松匹配（默认）：相似题干与选项</option><option value="strict">严格匹配：题干与全部选项一致</option></select></label>
+          <p class="hint" id="import-summary"></p>
+          <div class="actions"><button class="bank" id="import-bank">导入 TXT 题库</button><button id="import-clear">清除导入题库</button></div>
+          <div id="import-clear-preview" hidden><p class="hint" id="import-clear-text"></p><div class="actions"><button class="danger" id="import-clear-confirm">确认清除导入库</button><button id="import-clear-cancel">取消清除</button></div></div>
+          <input id="import-file" type="file" accept=".txt,.json,text/plain,application/json" hidden>
+          <p class="hint">以 TXT 为主，也支持本脚本导出的 JSON。宽松模式题干相似度至少80%，选项模糊对应至少85%；无法唯一对应时跳过。请暂停后导入。</p>
+          <div id="import-preview" hidden><pre id="import-preview-text"></pre><div class="actions"><button class="bank" id="import-confirm">确认导入</button><button id="import-cancel">取消预览</button><button id="import-report">导出无法识别清单</button></div></div>
           <div class="actions"><button class="bank" id="export-bank">导出纯文字题库</button><button id="export">导出记录</button><button id="export-excluded">导出未入库清单</button><button class="danger" id="clear">清除当前课程记录</button></div>
         </div></details>
         <details id="log-details"><summary>${svg('<path d="M5 5h14M5 12h14M5 19h8"/>')}运行记录<span id="log-count">暂无记录</span><span class="chevron">${downIcon}</span></summary><pre id="log"></pre></details>
@@ -944,6 +1207,7 @@
     uiExportCourse = $('#export-course', ui); uiCourseLabel = $('#course-label', ui);
     uiPanel = $('#assistant-panel', ui); uiOrb = $('#orb', ui);
     uiMode.value = settings.mode; uiDelay.value = settings.delay;
+    $('#import-match', ui).value = settings.importMatch;
     setupFloatingUI();
     uiStart.onclick = () => running || starting ? stop() : start();
     const changeSettings = () => {
@@ -956,6 +1220,41 @@
     uiDelay.oninput = () => {
       const delay = Number(uiDelay.value);
       if (uiDelay.value.trim() && Number.isFinite(delay) && delay >= 0 && delay <= 10000) changeSettings();
+    };
+    $('#import-match', ui).onchange = () => {
+      settings.importMatch = $('#import-match', ui).value;
+      candidateCache.clear(); GM_setValue(SETTINGS, settings);
+    };
+    uiExportCourse.onchange = () => {
+      stagedImport = null; $('#import-preview', ui).hidden = true;
+      importClearCourse = ''; $('#import-clear-preview', ui).hidden = true;
+      refreshImportSummary(); render();
+    };
+    $('#import-bank', ui).onclick = () => {
+      if (running || starting || busy || importBusy) { log('请先暂停后导入题库'); return; }
+      $('#import-file', ui).value = ''; $('#import-file', ui).click();
+    };
+    $('#import-file', ui).onchange = event => {
+      const file = event.target.files?.[0]; event.target.value = '';
+      if (file) previewBankFile(file);
+    };
+    $('#import-confirm', ui).onclick = () => changeImportedBank();
+    $('#import-clear', ui).onclick = () => {
+      if (running || starting || busy || importBusy) { log('请先暂停后清除导入题库'); return; }
+      const id = uiExportCourse.value || courseId();
+      if (!id) { log('请先选择课程'); return; }
+      importClearCourse = id;
+      const course = GM_getValue(COURSES, {})[id] || { id, name: '' };
+      $('#import-clear-text', ui).textContent = `确认清除“${course.name || id}”的导入候选？已确认答案和尝试记录保留，其他课程不受影响。`;
+      $('#import-clear-preview', ui).hidden = false; render();
+    };
+    $('#import-clear-confirm', ui).onclick = () => changeImportedBank(true);
+    $('#import-clear-cancel', ui).onclick = () => { importClearCourse = ''; $('#import-clear-preview', ui).hidden = true; render(); };
+    $('#import-cancel', ui).onclick = () => { stagedImport = null; $('#import-preview', ui).hidden = true; render(); };
+    $('#import-report', ui).onclick = () => {
+      if (!stagedImport?.parsed.excluded.length) return;
+      const text = stagedImport.parsed.excluded.map(item => `${item.number}. ${item.title}\n原因：${item.reason}`).join('\n\n');
+      download('题库导入无法识别清单.txt', '\uFEFF' + text, 'text/plain;charset=utf-8');
     };
     $('#export', ui).onclick = () => {
       try {
@@ -983,10 +1282,15 @@
       } catch (error) { log(error.message); }
     };
     $('#clear', ui).onclick = () => {
-      if (running || starting || busy) { log('请先暂停后清除记录'); return; }
+      if (running || starting || busy || importBusy) { log('请先暂停后清除记录'); return; }
       if (!courseId() || !confirm(`清除当前页面课程 ${GM_getValue(COURSES, {})[courseId()]?.name || courseId()} 的本地答案和尝试记录？网站成绩不会被修改，其他课程记录保留。`)) return;
       dbCourse = courseId(); db = { version: 1, questions: {}, rounds: {}, pending: null };
-      loadMasteryChecks(dbCourse); checks = { version: 1, entries: {} }; saveMasteryChecks(); save(); log('本课程本地记录已清除');
+      // 清除所有课程记录也删除导入库；避免 save() 的跨页面合并重新带回旧导入项。
+      db.imported = []; db.importRevision = (Number(GM_getValue(PREFIX + dbCourse, null)?.importRevision) || 0) + 1;
+      GM_setValue(PREFIX + dbCourse, db); candidateCache.clear();
+      stagedImport = null; $('#import-preview', ui).hidden = true;
+      importClearCourse = ''; $('#import-clear-preview', ui).hidden = true;
+      loadMasteryChecks(dbCourse); checks = { version: 1, entries: {} }; saveMasteryChecks(); refreshImportSummary(); log('本课程本地记录与导入题库已清除');
     };
     refreshProgress(); render();
   }
