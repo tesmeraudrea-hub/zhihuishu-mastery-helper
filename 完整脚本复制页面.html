@@ -1,15 +1,18 @@
 <!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>掌握度练习助手 v1.5.2 · 完整代码</title>
+<title>知到智慧树掌握度满分助手 v1.5.3 · 完整代码</title>
 <style>body{max-width:920px;margin:40px auto;padding:0 20px;font:17px/1.7 system-ui;background:#f6f7fb;color:#253047}h1{font-size:28px}button{background:#604ffd;color:white;border:0;border-radius:8px;padding:14px 22px;font:inherit;cursor:pointer}textarea{display:block;width:100%;height:320px;box-sizing:border-box;margin:18px 0;font:13px/1.5 monospace}#status{min-height:30px;color:#4835bc}li{margin:10px 0}</style>
-<h1>掌握度练习助手 v1.5.2</h1>
+<h1>知到智慧树掌握度满分助手 v1.5.3</h1>
+<p role="note" style="padding:14px 18px;background:#fff1f0;color:#a61b1b;border:2px solid #d92d20;border-radius:8px;font-weight:700">警告：本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负</p>
+<p>作者：Watson · MIT 许可</p>
 <p>此页面包含经过语法检查的完整脚本。按以下步骤更新原来的脚本条目，保留答案记录和设置。</p>
-<ol><li>点击下方“复制完整脚本”。</li><li>进入篡改猴中原脚本的<strong>代码编辑区</strong>，先点击代码，再按 <strong>Ctrl+A</strong> 全选，按 <strong>Ctrl+V</strong> 整体替换，然后按 <strong>Ctrl+S</strong> 保存。</li><li>刷新智慧树页面。悬浮窗标题显示 <strong>v1.5.2</strong>，即可确认新代码已运行。</li></ol>
+<ol><li>点击下方“复制完整脚本”。</li><li>进入篡改猴中原脚本的<strong>代码编辑区</strong>，先点击代码，再按 <strong>Ctrl+A</strong> 全选，按 <strong>Ctrl+V</strong> 整体替换，然后按 <strong>Ctrl+S</strong> 保存。</li><li>刷新智慧树页面。悬浮窗标题显示 <strong>v1.5.3</strong>，即可确认新代码已运行。</li></ol>
 <button id="copy">复制完整脚本</button><p id="status" role="status">请整体替换，不要将新代码追加到旧代码后面。无需删除原脚本或清除数据。</p>
 <textarea id="source" aria-label="完整脚本代码" readonly spellcheck="false">// ==UserScript==
-// @name         智慧树掌握度练习助手（逐题排除）
+// @name         知到智慧树掌握度满分助手
+// @author       Watson
 // @namespace    local.zhihuishu.mastery.practice
-// @version      1.5.2
+// @version      1.5.3
 // @description  掌握度练习：仅跳过免考和100%掌握度，逐题尝试至全对，显示满分进度，支持按课程导出题库。
 // @match        https://studywisdomh5.zhihuishu.com/*
 // @grant        GM_getValue
@@ -19,6 +22,7 @@
 // @run-at       document-idle
 // @noframes
 // @license      MIT
+// 警告：本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负
 // ==/UserScript==
 
 (function () {
@@ -436,7 +440,7 @@
     if (logs.length &gt; 150) logs.shift();
     const savedLogs = courseLogs[course] ||= [];
     savedLogs.push(logs.at(-1)); if (savedLogs.length &gt; 150) savedLogs.shift();
-    console.info('[掌握度练习助手]', message);
+    console.info('[知到智慧树掌握度满分助手]', message);
     render();
   }
   function stop(reason = '已手动暂停') {
@@ -787,9 +791,11 @@
       header{padding:10px 12px;background:#604ffd;color:white;display:flex;justify-content:space-between;align-items:center;font-weight:700}
       button,select,input{font:inherit}button{cursor:pointer;border:1px solid #d9ddea;background:#f7f8fc;border-radius:6px;padding:6px 9px;color:#253047}button:disabled{opacity:.6;cursor:default}
       header button{color:white;border:0;background:transparent;padding:0 4px}main{padding:12px}p{margin:0 0 8px;white-space:pre-wrap;overflow-wrap:anywhere}progress{width:100%;height:9px;accent-color:#00bd85;margin-bottom:8px}#progress{font-size:12px;color:#3b6355}
+      .usage-warning{padding:9px 12px;background:#fff1f0;color:#a61b1b;border-bottom:1px solid #ffc9c3;font-size:12px;line-height:1.6}
       label{display:block;margin:8px 0}select{width:100%;padding:5px;border:1px solid #d9ddea;border-radius:5px;background:#fff}input[type=number]{width:80px;padding:3px}
       .actions{display:flex;gap:7px;flex-wrap:wrap}.primary{background:#604ffd;color:white;border-color:#604ffd}pre{font:11px/1.6 monospace;white-space:pre-wrap;max-height:140px;overflow:auto;background:#f5f6fb;padding:8px;border-radius:6px;margin:10px 0 0}small{color:#737c8e}section.mini main{display:none}
-    &lt;/style&gt;&lt;section&gt;&lt;header&gt;掌握度练习助手 v1.5.2 &lt;button id="fold"&gt;收起&lt;/button&gt;&lt;/header&gt;&lt;main&gt;
+    &lt;/style&gt;&lt;section&gt;&lt;header&gt;知到智慧树掌握度满分助手 v1.5.3 &lt;button id="fold"&gt;收起&lt;/button&gt;&lt;/header&gt;
+      &lt;aside class="usage-warning" role="note"&gt;&lt;strong&gt;警告：&lt;/strong&gt;本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负&lt;/aside&gt;&lt;main&gt;
       &lt;p id="status"&gt;&lt;/p&gt;&lt;p id="progress"&gt;&lt;/p&gt;&lt;progress id="progress-bar" aria-label="可练习知识点满分进度" max="1" value="0"&gt;&lt;/progress&gt;&lt;label&gt;&lt;select id="mode"&gt;&lt;option value="all"&gt;全部知识点：仅跳过免考和100%&lt;/option&gt;&lt;option value="current"&gt;当前知识点：本轮全对后停止&lt;/option&gt;&lt;/select&gt;&lt;/label&gt;
       &lt;label&gt;操作间隔 &lt;input id="delay" type="number" min="0" max="10000" step="50"&gt; 毫秒&lt;/label&gt;
       &lt;small style="display:block;margin:0 0 8px"&gt;操作间隔为选项切换、悬浮弹窗和页面更新提供响应时间，如流畅运行可尝试更低值&lt;/small&gt;
