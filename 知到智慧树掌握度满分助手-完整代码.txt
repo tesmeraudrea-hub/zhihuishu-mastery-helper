@@ -2,7 +2,7 @@
 // @name         知到智慧树掌握度满分助手
 // @author       Watson
 // @namespace    local.zhihuishu.mastery.practice
-// @version      1.6.0
+// @version      1.6.1
 // @description  仅用于智慧树掌握度练习：自动选择、提交并按批改重答至全对，仅跳过免考和100%；可拖动面板与悬浮球，显示满分进度，按课程学习多选分布并导出题库。
 // @match        https://studywisdomh5.zhihuishu.com/*
 // @grant        GM_getValue
@@ -48,7 +48,7 @@
   }
   function answerModel(records) {
     const model = {};
-    // 所有课程统一仅使用本课程已确认答案，不含课程专用 ID 或预置分布。
+    // 只统计本课程已确认答案；默认数量分布在排序时叠加，不写进题库。
     const seen = new Set();
     for (const [key, record] of Object.entries(records || {})) {
       if (record.type !== '多选题' || !record.correct?.length) continue;
@@ -69,8 +69,15 @@
   function rankedCombinations(question, model = {}) {
     const candidates = combinations(question.options.map(o => o.token), question.multiple);
     const n = question.options.length;
-    const counts = model[n];
-    if (!question.multiple || !counts || Object.values(counts).reduce((sum, count) => sum + count, 0) < 12) return candidates;
+    if (!question.multiple) return candidates;
+    // 原课程46道五选题的正确选项数量分布，仅作为所有课程的弱先验。
+    // 折算为20道样本；当前课程每道去重后的正确题计1道，逐渐占据主要权重。
+    // 四选题原样本仅5道，其余选项数无可靠统计，仍保留原有冷启动顺序。
+    const prior = n === 5 ? { 2: 1, 3: 28, 4: 16, 5: 1 } : {};
+    const priorTotal = Object.values(prior).reduce((sum, count) => sum + count, 0);
+    const counts = { ...(model[n] || {}) };
+    for (const [size, count] of Object.entries(prior)) counts[size] = (counts[size] || 0) + 20 * count / priorTotal;
+    if (Object.values(counts).reduce((sum, count) => sum + count, 0) < 12) return candidates;
     // 同一数量有 C(n,k) 个具体组合；用每个组合的概率排序，而非只看数量占比。
     // 每个组合添加 1/(2^n-1) 平滑权重，罕见答案仍保留在完整枚举中。
     const score = choice => (counts[choice.length] || 0) / binomial(n, choice.length) + 1 / (2 ** n - 1);
@@ -910,9 +917,9 @@
       #orb:hover{box-shadow:0 10px 32px #6650c967;filter:brightness(1.05)}#orb:active{transform:none}.orb-inner{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;width:56px;height:56px;border-radius:50%;background:linear-gradient(150deg,#8a76f5,#6651d3);color:#fff;border:1px solid #ffffff55;pointer-events:none}.orb-inner svg{width:23px;height:23px}#orb-percent{font-size:9px;font-weight:650;line-height:1.2;color:#f2eeff}.orb-dot{position:absolute;right:0;bottom:1px;width:13px;height:13px;border:3px solid #fff;border-radius:50%;background:#b7afca;pointer-events:none}#orb[data-state="running"] .orb-dot{background:#29b887}#orb[data-state="starting"] .orb-dot{background:#f0b75c}
       @media(prefers-reduced-motion:reduce){*{transition:none!important}}@media(max-height:600px){.usage-warning{font-size:10px;padding:8px 14px}.panel-header{padding:12px 14px}main{padding:12px 14px}.control-bar{padding:10px 14px}.control-hint{display:none}}
     </style>
-    <section class="panel" id="assistant-panel" role="region" aria-label="知到智慧树掌握度满分助手 v1.6.0">
+    <section class="panel" id="assistant-panel" role="region" aria-label="知到智慧树掌握度满分助手 v1.6.1">
       <header class="panel-header" id="drag-handle" title="拖动标题栏移动面板">
-        <div class="brand-mark">${bookIcon}</div><div class="identity"><h1>知到智慧树掌握度满分助手</h1><small>掌握每一个知识点 <span class="version">v1.6.0</span></small></div>
+        <div class="brand-mark">${bookIcon}</div><div class="identity"><h1>知到智慧树掌握度满分助手</h1><small>掌握每一个知识点 <span class="version">v1.6.1</span></small></div>
         <button id="fold" type="button" aria-label="收起为悬浮球" title="收起为悬浮球">${svg('<path d="M6 12h12"/>')}</button>
       </header>
       <aside class="usage-warning" role="note"><strong>警告：</strong>本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负<p>脚本不会自动识别课程是否限制答题次数，请在启动前自行确认。</p></aside>
