@@ -2,8 +2,8 @@
 // @name         知到智慧树掌握度满分助手
 // @author       Watson
 // @namespace    local.zhihuishu.mastery.practice
-// @version      1.5.4
-// @description  仅用于智慧树掌握度练习：自动选择、提交并按批改重答至全对，仅跳过免考和100%；显示满分进度，按课程学习多选分布并导出题库。
+// @version      1.6.0
+// @description  仅用于智慧树掌握度练习：自动选择、提交并按批改重答至全对，仅跳过免考和100%；可拖动面板与悬浮球，显示满分进度，按课程学习多选分布并导出题库。
 // @match        https://studywisdomh5.zhihuishu.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -256,6 +256,7 @@
   const SESSION = PREFIX + 'run';
   const SETTINGS = PREFIX + 'settings';
   const COURSES = PREFIX + 'courses';
+  const UI_SETTINGS = PREFIX + 'ui';
   const SELECTORS = {
     cards: '.mastery-content-right .chunk-list .item-box',
     cardName: '.item-box-name',
@@ -275,6 +276,7 @@
   let checks, checksCourse = '';
   let screen, ui, uiStatus, uiLog, uiStart, uiMode, uiDelay, uiProgress, uiProgressBar;
   let uiExportCourse, uiCourseLabel, lastExportPageCourse = '', courseOptionSignature = '';
+  let floatingState, uiPanel, uiOrb, dragSession = null;
   let metadataRoute = '', metadataSince = Date.now();
   const courseLogs = {};
 
@@ -326,7 +328,7 @@
     for (const key of GM_listValues()) {
       if (!key.startsWith(PREFIX)) continue;
       const id = key.slice(PREFIX.length);
-      if (!id || ['settings', 'run', 'courses'].includes(id) || id.startsWith('guess-trace:')) continue;
+      if (!id || ['settings', 'run', 'courses', 'ui'].includes(id) || id.startsWith('guess-trace:')) continue;
       const records = GM_getValue(key, null);
       if (records?.version === 1 && records.questions && records.rounds) registerCourse(id, records.course?.id === id ? records.course.name : '');
     }
@@ -346,7 +348,8 @@
     }
     const courses = GM_getValue(COURSES, {});
     const current = courses[id] || { id, name: '' };
-    uiCourseLabel.textContent = id ? `当前课程：${current.name || '课程名称待识别'}\nID：${id}` : '当前未打开课程';
+    uiCourseLabel.textContent = id ? current.name || '课程名称待识别' : '当前未打开课程';
+    uiCourseLabel.title = id ? `${current.name || '课程名称待识别'}\nID：${id}` : '';
     const signature = JSON.stringify(courses);
     const pageChanged = id !== lastExportPageCourse;
     if (signature !== courseOptionSignature || pageChanged) {
@@ -401,7 +404,12 @@
         if (JSON.stringify(db.progress) !== JSON.stringify(snapshot)) { db.progress = snapshot; save(); }
       }
       const progress = db.progress?.perfect !== undefined ? db.progress : null;
-      uiProgress.textContent = progress ? `满分进度：已确认100% ${progress.perfect}/${progress.eligible}（${progress.percent}%）\n免考 ${progress.exempt} · 剩余 ${progress.remaining} · 尚待核实 ${progress.unchecked}${cards.length ? '' : '\n以上为最近一次热力图核实结果'}` : '满分进度：等待热力图核实掌握度';
+      uiProgress.textContent = progress ? `免考 ${progress.exempt} · 剩余 ${progress.remaining} · 尚待核实 ${progress.unchecked}${cards.length ? '' : '\n最近一次热力图核实结果'}` : '等待热力图核实掌握度';
+      $('#completed-count', ui).textContent = progress ? progress.perfect : '—';
+      $('#total-count', ui).textContent = progress ? progress.eligible : '—';
+      $('#progress-percent', ui).textContent = progress ? `${progress.percent}%` : '—';
+      $('#orb-percent', ui).textContent = progress ? `${progress.percent}%` : '掌握度';
+      uiOrb.style.setProperty('--orb-progress', `${progress?.percent || 0}%`);
       uiProgressBar.max = progress?.eligible || 1;
       uiProgressBar.value = progress?.perfect || 0;
     } catch (error) { uiProgress.textContent = `总进度暂不可用：${error.message}`; }
@@ -415,11 +423,18 @@
   }
   function render() {
     if (!ui) return;
-    uiStatus.textContent = `${running ? '运行中' : starting ? '启动中' : '已暂停'} · ${status}${activeName ? '\n' + activeName : ''}`;
+    const state = running ? 'running' : starting ? 'starting' : 'paused';
+    const stateLabel = running ? '运行中' : starting ? '准备中' : '已暂停';
+    uiPanel.dataset.state = uiOrb.dataset.state = state;
+    $('#run-state', ui).textContent = stateLabel;
+    uiStatus.textContent = `${status}${activeName ? '\n' + activeName : ''}`;
+    uiStatus.title = uiStatus.textContent;
+    uiOrb.setAttribute('aria-label', `展开掌握度满分助手，${stateLabel}`);
     uiStart.textContent = running || starting ? '暂停' : '开始 / 继续';
     uiStart.disabled = false;
     uiMode.disabled = running || starting;
     uiLog.textContent = logs.slice(-12).join('\n');
+    $('#log-count', ui).textContent = logs.length ? `${Math.min(logs.length, 12)} 条` : '暂无记录';
     uiLog.scrollTop = uiLog.scrollHeight;
   }
   function log(message, course = courseId()) {
@@ -768,35 +783,161 @@
     anchor.href = url; anchor.download = filename; anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
+  function saveFloatingState() { GM_setValue(UI_SETTINGS, floatingState); }
+  function placeFloatingUI(position) {
+    const target = floatingState.collapsed ? uiOrb : uiPanel;
+    const rect = target.getBoundingClientRect();
+    const key = floatingState.collapsed ? 'orb' : 'panel';
+    const point = position || floatingState[key] || { x: 18, y: innerHeight - rect.height - 18 };
+    const margin = 12;
+    const maxX = Math.max(0, innerWidth - rect.width - margin);
+    const maxY = Math.max(0, innerHeight - rect.height - margin);
+    const x = Math.min(maxX, Math.max(Math.min(margin, maxX), point.x));
+    const y = Math.min(maxY, Math.max(Math.min(margin, maxY), point.y));
+    floatingState[key] = { x, y };
+    screen.style.left = x + 'px'; screen.style.top = y + 'px';
+  }
+  function setFloatingCollapsed(collapsed) {
+    const rect = (floatingState.collapsed ? uiOrb : uiPanel).getBoundingClientRect();
+    floatingState.collapsed = collapsed;
+    uiPanel.hidden = collapsed; uiOrb.hidden = !collapsed;
+    uiOrb.setAttribute('aria-expanded', String(!collapsed));
+    const width = collapsed ? 64 : uiPanel.getBoundingClientRect().width;
+    placeFloatingUI({ x: rect.right - width, y: rect.top });
+    saveFloatingState();
+    (collapsed ? uiOrb : $('#fold', ui)).focus({ preventScroll: true });
+  }
+  function setupFloatingUI() {
+    const saved = GM_getValue(UI_SETTINGS, {}) || {};
+    const readPoint = point => point && Number.isFinite(point.x) && Number.isFinite(point.y) ? { x: point.x, y: point.y } : null;
+    floatingState = { collapsed: saved.collapsed === true, panel: readPoint(saved.panel), orb: readPoint(saved.orb) };
+    uiPanel.hidden = floatingState.collapsed; uiOrb.hidden = !floatingState.collapsed;
+    uiOrb.setAttribute('aria-expanded', String(!floatingState.collapsed));
+    placeFloatingUI();
+    let ignoreOrbClick = false;
+    $('#fold', ui).onclick = () => setFloatingCollapsed(true);
+    uiOrb.onclick = event => {
+      if (ignoreOrbClick && event.detail !== 0) { event.preventDefault(); return; }
+      setFloatingCollapsed(false);
+    };
+    for (const handle of [$('#drag-handle', ui), uiOrb]) {
+      handle.addEventListener('pointerdown', event => {
+        if (event.button !== 0 || dragSession || (handle !== uiOrb && event.target.closest('button, input, select, a'))) return;
+        const rect = screen.getBoundingClientRect();
+        dragSession = { handle, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, x: rect.left, y: rect.top, moved: false };
+        handle.setPointerCapture(event.pointerId);
+        event.preventDefault();
+      });
+      handle.addEventListener('pointermove', event => {
+        if (!dragSession || dragSession.handle !== handle || dragSession.pointerId !== event.pointerId) return;
+        const dx = event.clientX - dragSession.startX, dy = event.clientY - dragSession.startY;
+        if (!dragSession.moved && Math.hypot(dx, dy) < 4) return;
+        dragSession.moved = true;
+        screen.dataset.dragging = 'true';
+        placeFloatingUI({ x: dragSession.x + dx, y: dragSession.y + dy });
+      });
+      const endDrag = event => {
+        if (!dragSession || dragSession.handle !== handle || dragSession.pointerId !== event.pointerId) return;
+        if (dragSession.moved) {
+          if (handle === uiOrb) { ignoreOrbClick = true; setTimeout(() => { ignoreOrbClick = false; }, 0); }
+          saveFloatingState();
+        }
+        dragSession = null; delete screen.dataset.dragging;
+        if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+      };
+      handle.addEventListener('pointerup', endDrag);
+      handle.addEventListener('pointercancel', endDrag);
+      handle.addEventListener('lostpointercapture', endDrag);
+    }
+    let placementFrame = 0, resizeTimer;
+    const schedulePlacement = () => {
+      cancelAnimationFrame(placementFrame);
+      placementFrame = requestAnimationFrame(() => { if (!dragSession) placeFloatingUI(); });
+    };
+    addEventListener('resize', () => {
+      schedulePlacement();
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(saveFloatingState, 200);
+    });
+    ui.querySelectorAll('details').forEach(details => details.addEventListener('toggle', schedulePlacement));
+    if (typeof ResizeObserver === 'function') new ResizeObserver(schedulePlacement).observe(uiPanel);
+  }
   function setupUI() {
     screen = document.createElement('div'); screen.id = 'zhs-mastery-practice-panel';
-    screen.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:2147483646;';
+    screen.style.cssText = 'position:fixed;left:18px;top:18px;z-index:2147483646;';
     document.body.append(screen);
     ui = screen.attachShadow({ mode: 'open' });
+    const svg = path => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${path}</svg>`;
+    const bookIcon = svg('<path d="M12 6v14M3 4h5a4 4 0 0 1 4 3 4 4 0 0 1 4-3h5v14h-5a4 4 0 0 0-4 2 4 4 0 0 0-4-2H3Z"/>');
+    const downIcon = svg('<path d="m7 10 5 5 5-5"/>');
     ui.innerHTML = `<style>
-      :host{all:initial;font:13px/1.55 system-ui,"Microsoft YaHei",sans-serif;color:#253047}
-      *{box-sizing:border-box}section{width:315px;background:#fff;border:1px solid #d9ddea;border-radius:12px;box-shadow:0 8px 30px #25304730;overflow:hidden}
-      header{padding:10px 12px;background:#604ffd;color:white;display:flex;justify-content:space-between;align-items:center;font-weight:700}
-      button,select,input{font:inherit}button{cursor:pointer;border:1px solid #d9ddea;background:#f7f8fc;border-radius:6px;padding:6px 9px;color:#253047}button:disabled{opacity:.6;cursor:default}
-      header button{color:white;border:0;background:transparent;padding:0 4px}main{padding:12px}p{margin:0 0 8px;white-space:pre-wrap;overflow-wrap:anywhere}progress{width:100%;height:9px;accent-color:#00bd85;margin-bottom:8px}#progress{font-size:12px;color:#3b6355}
-      .usage-warning{padding:9px 12px;background:#fff1f0;color:#a61b1b;border-bottom:1px solid #ffc9c3;font-size:12px;line-height:1.6}
-      .usage-warning p{margin:6px 0 0}
-      label{display:block;margin:8px 0}select{width:100%;padding:5px;border:1px solid #d9ddea;border-radius:5px;background:#fff}input[type=number]{width:80px;padding:3px}
-      .actions{display:flex;gap:7px;flex-wrap:wrap}.primary{background:#604ffd;color:white;border-color:#604ffd}pre{font:11px/1.6 monospace;white-space:pre-wrap;max-height:140px;overflow:auto;background:#f5f6fb;padding:8px;border-radius:6px;margin:10px 0 0}small{color:#737c8e}section.mini main{display:none}
-    </style><section><header>知到智慧树掌握度满分助手 v1.5.4 <button id="fold">收起</button></header>
-      <aside class="usage-warning" role="note"><strong>警告：</strong>本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负<p>脚本不会自动识别课程是否限制答题次数，请在启动前自行确认。</p></aside><main>
-      <p id="status"></p><p id="progress"></p><progress id="progress-bar" aria-label="可练习知识点满分进度" max="1" value="0"></progress><label><select id="mode"><option value="all">全部知识点：仅跳过免考和100%</option><option value="current">当前知识点：本轮全对后停止</option></select></label>
-      <label>操作间隔 <input id="delay" type="number" min="0" max="10000" step="50"> 毫秒</label>
-      <small style="display:block;margin:0 0 8px">操作间隔为选项切换、悬浮弹窗和页面更新提供响应时间，如流畅运行可尝试更低值</small>
-      <p id="course-label" style="font-size:11px;color:#737c8e"></p><label>导出课程 <select id="export-course" aria-label="导出课程"></select></label>
-      <div class="actions"><button class="primary" id="start">开始 / 继续</button><button id="export">导出记录</button><button id="export-bank">导出纯文字题库</button><button id="export-excluded">导出未入库清单</button><button id="clear">清除当前课程记录</button></div>
-      <small>单选逐项尝试，多选枚举组合；验证码出现后暂停。</small><pre id="log"></pre>
-    </main></section>`;
+      :host{all:initial;display:block;font:13px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#24253d}
+      *{box-sizing:border-box} [hidden]{display:none!important}button,input,select{font:inherit}button,summary{cursor:pointer}svg{width:20px;height:20px;flex-shrink:0}
+      button{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid #e5e5ef;border-radius:11px;background:#fff;color:#414258;min-height:38px;padding:8px 12px;transition:background .15s,box-shadow .15s,transform .15s}
+      button:hover{background:#f3f1ff;border-color:#d4cffb}button:active{transform:translateY(1px)}button:disabled{opacity:.5;cursor:default}
+      button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #b7abfa;outline-offset:3px}
+      .panel{width:min(380px,calc(100vw - 24px));max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px);display:flex;flex-direction:column;border:1px solid #ffffffd9;border-radius:22px;background:#fcfcff;box-shadow:0 20px 65px #23234026,0 3px 12px #23234012;overflow:hidden}
+      .panel-header{display:flex;align-items:center;gap:11px;padding:16px 18px;background:linear-gradient(120deg,#fff,#f3f0ff);border-bottom:1px solid #ece9f7;cursor:grab;touch-action:none;user-select:none}
+      :host([data-dragging="true"]) .panel-header,:host([data-dragging="true"]) #orb{cursor:grabbing}
+      .brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:13px;background:linear-gradient(145deg,#8874ff,#6050dc);color:#fff;box-shadow:0 4px 12px #6756dd30}
+      .brand-mark svg{width:23px;height:23px}.identity{flex:1;min-width:0}.identity h1{font-size:14px;line-height:1.5;margin:0;font-weight:750;letter-spacing:-.2px}
+      .identity small{display:flex;gap:8px;align-items:center;color:#8b89a0;font-size:10px;margin-top:2px}.version{color:#7466be}
+      #fold{width:32px;min-height:32px;border-radius:10px;padding:0;border:0;background:#ffffffb3;color:#80779e}
+      .usage-warning{margin:0;padding:11px 18px;background:#fff5f3;border-bottom:1px solid #f9e4df;color:#a94437;font-size:11px;line-height:1.65;flex-shrink:0}.usage-warning strong{font-weight:700}.usage-warning p{margin:4px 0 0;color:#ad6055}
+      main{padding:17px 18px;overflow-y:auto;min-height:0;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#d5d1e8 transparent}
+      .progress-card{border:1px solid #e7e3fa;background:linear-gradient(130deg,#f7f4ff,#fcfbff);border-radius:17px;padding:15px;margin-bottom:14px}
+      .progress-heading{display:flex;justify-content:space-between;align-items:center;color:#686080;font-size:11px;font-weight:600;letter-spacing:.4px}
+      #progress-percent{color:#6c53d9;background:#ece6ff;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700}
+      .progress-metric{display:flex;align-items:baseline;gap:7px;margin:7px 0 8px}.progress-metric strong{font-size:36px;line-height:1.2;font-weight:750;letter-spacing:-1.5px;color:#413176}.progress-metric span{color:#736881;font-size:12px}
+      progress{display:block;appearance:none;width:100%;height:7px;border:0;border-radius:10px;overflow:hidden;background:#e8e4f4;accent-color:#7963e8}
+      progress::-webkit-progress-bar{background:#e8e4f4;border-radius:10px}progress::-webkit-progress-value{background:linear-gradient(90deg,#9480ff,#6c55d8);border-radius:10px;transition:width .3s}progress::-moz-progress-bar{background:#7963e8;border-radius:10px}
+      #progress{white-space:pre-wrap;margin:9px 0 0;font-size:10px;line-height:1.6;color:#756b83}
+      .status-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.status-badge{display:inline-flex;align-items:center;gap:6px;color:#7d7b91;background:#f0eff5;border-radius:20px;padding:3px 9px;font-size:10px;font-weight:600}
+      .status-badge:before{content:"";width:5px;height:5px;border-radius:50%;background:#a09bac}.panel[data-state="running"] .status-badge{color:#158563;background:#e8f8f1}.panel[data-state="running"] .status-badge:before{background:#24ac80}.panel[data-state="starting"] .status-badge{color:#7864cd;background:#eee9ff}
+      .status-caption{font-size:10px;color:#aaa4b7}#status{margin:0 0 16px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.65;color:#777185;max-height:74px;overflow:auto}
+      .field{display:block;margin-bottom:13px}.field-name{display:block;font-size:11px;font-weight:650;color:#5a546c;margin-bottom:6px}
+      select{appearance:auto;width:100%;min-height:39px;padding:8px 10px;border:1px solid #e4e1ed;border-radius:10px;background:#fff;color:#514b65;font-size:12px}
+      select:disabled{color:#9d95aa;background:#f7f5fa}input[type="number"]{width:98px;min-height:36px;padding:6px 9px;border:1px solid #e3dfed;border-radius:10px;background:#fff;color:#504667;font-size:13px}
+      .delay-row{display:flex;align-items:center;justify-content:space-between;gap:12px}.delay-row .field-name{margin:0}.delay-control{display:flex;align-items:center;gap:8px;font-size:11px;color:#9790a4}
+      .hint{margin:7px 0 14px;color:#776f86;font-size:10px;line-height:1.65}
+      .course-strip{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:10px 11px;border-radius:11px;background:#f1f1f8;color:#8d87a0;font-size:10px}.course-strip svg{width:15px;height:15px;color:#a69cbe}#course-label{margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;color:#686176;font-size:11px}
+      details{border:1px solid #e9e6f1;border-radius:12px;background:#fff;margin-top:9px;overflow:hidden}summary{display:flex;align-items:center;gap:8px;list-style:none;padding:11px 12px;color:#686176;font-size:11px;font-weight:600;user-select:none}summary::-webkit-details-marker{display:none}summary>svg:first-child{width:16px;height:16px;color:#a49bb8}summary .chevron{margin-left:auto;width:15px;height:15px;color:#aaa3b6;transition:transform .15s}details[open] summary .chevron{transform:rotate(180deg)}details[open] summary{border-bottom:1px solid #efecf5}
+      .details-body{padding:12px}.details-body .field{margin-bottom:10px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}.actions button{font-size:11px;min-height:36px;padding:7px 8px}.actions .bank{background:#f0ecff;border-color:#e4dcff;color:#7560cc}.actions .danger{grid-column:1/-1;color:#be7569;border-color:#f2e4e1;background:#fffafa;font-size:10px}
+      #log-count{font-size:10px;font-weight:400;color:#b1aabb;margin-left:2px}pre{font:10px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace;margin:0;padding:11px 12px;max-height:144px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#faf9fe;color:#8f849f;min-height:42px}
+      .control-bar{padding:12px 18px 14px;border-top:1px solid #eae7f1;background:#fff;flex-shrink:0}.primary{width:100%;min-height:42px;border:0;background:linear-gradient(100deg,#8069f1,#6650d3);box-shadow:0 4px 12px #7963dd26;color:#fff;font-size:13px;font-weight:650}.primary:hover{background:linear-gradient(100deg,#735de6,#5d46c6);border:0}.primary:before{content:"";width:0;height:0;border-top:5px solid transparent;border-bottom:5px solid transparent;border-left:7px solid currentColor;margin-right:3px}.panel[data-state="running"] .primary:before,.panel[data-state="starting"] .primary:before{width:7px;height:10px;border:0;border-left:2px solid currentColor;border-right:2px solid currentColor}
+      .control-hint{display:block;text-align:center;margin-top:7px;font-size:9px;color:#b6afc1}
+      #orb{--orb-progress:0%;width:64px;height:64px;min-height:64px;border:0;border-radius:50%;padding:4px;display:grid;place-items:center;background:conic-gradient(#ad9dff var(--orb-progress),#7660df var(--orb-progress));box-shadow:0 8px 26px #6650c946,0 0 0 1px #ffffffb3;cursor:grab;touch-action:none;user-select:none;position:relative;transition:box-shadow .15s,filter .15s}
+      #orb:hover{box-shadow:0 10px 32px #6650c967;filter:brightness(1.05)}#orb:active{transform:none}.orb-inner{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;width:56px;height:56px;border-radius:50%;background:linear-gradient(150deg,#8a76f5,#6651d3);color:#fff;border:1px solid #ffffff55;pointer-events:none}.orb-inner svg{width:23px;height:23px}#orb-percent{font-size:9px;font-weight:650;line-height:1.2;color:#f2eeff}.orb-dot{position:absolute;right:0;bottom:1px;width:13px;height:13px;border:3px solid #fff;border-radius:50%;background:#b7afca;pointer-events:none}#orb[data-state="running"] .orb-dot{background:#29b887}#orb[data-state="starting"] .orb-dot{background:#f0b75c}
+      @media(prefers-reduced-motion:reduce){*{transition:none!important}}@media(max-height:600px){.usage-warning{font-size:10px;padding:8px 14px}.panel-header{padding:12px 14px}main{padding:12px 14px}.control-bar{padding:10px 14px}.control-hint{display:none}}
+    </style>
+    <section class="panel" id="assistant-panel" role="region" aria-label="知到智慧树掌握度满分助手 v1.6.0">
+      <header class="panel-header" id="drag-handle" title="拖动标题栏移动面板">
+        <div class="brand-mark">${bookIcon}</div><div class="identity"><h1>知到智慧树掌握度满分助手</h1><small>掌握每一个知识点 <span class="version">v1.6.0</span></small></div>
+        <button id="fold" type="button" aria-label="收起为悬浮球" title="收起为悬浮球">${svg('<path d="M6 12h12"/>')}</button>
+      </header>
+      <aside class="usage-warning" role="note"><strong>警告：</strong>本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负<p>脚本不会自动识别课程是否限制答题次数，请在启动前自行确认。</p></aside>
+      <main>
+        <div class="progress-card"><div class="progress-heading"><span>已确认满分</span><span id="progress-percent">—</span></div><div class="progress-metric"><strong id="completed-count">—</strong><span>/ <span id="total-count">—</span> 个可练习知识点</span></div><progress id="progress-bar" aria-label="可练习知识点满分进度" max="1" value="0"></progress><p id="progress"></p></div>
+        <div class="status-row"><span class="status-badge" id="run-state">已暂停</span><span class="status-caption">跟随页面实时反馈</span></div><p id="status" role="status" aria-live="polite"></p>
+        <label class="field"><span class="field-name">练习范围</span><select id="mode" aria-label="练习范围"><option value="all">全部知识点：仅跳过免考和100%</option><option value="current">当前知识点：本轮全对后停止</option></select></label>
+        <label class="delay-row"><span class="field-name">操作间隔</span><span class="delay-control"><input id="delay" aria-label="操作间隔" type="number" min="0" max="10000" step="50"><span>毫秒</span></span></label>
+        <p class="hint">操作间隔为选项切换、悬浮弹窗和页面更新提供响应时间，如流畅运行可尝试更低值</p>
+        <div class="course-strip">${bookIcon}<p id="course-label"></p></div>
+        <details id="export-details"><summary>${svg('<path d="M12 3v12m-4-4 4 4 4-4M5 16v5h14v-5"/>')}题库与记录<span class="chevron">${downIcon}</span></summary><div class="details-body">
+          <label class="field"><span class="field-name">导出课程</span><select id="export-course" aria-label="导出课程"></select></label>
+          <div class="actions"><button class="bank" id="export-bank">导出纯文字题库</button><button id="export">导出记录</button><button id="export-excluded">导出未入库清单</button><button class="danger" id="clear">清除当前课程记录</button></div>
+        </div></details>
+        <details id="log-details"><summary>${svg('<path d="M5 5h14M5 12h14M5 19h8"/>')}运行记录<span id="log-count">暂无记录</span><span class="chevron">${downIcon}</span></summary><pre id="log"></pre></details>
+      </main>
+      <footer class="control-bar"><button class="primary" id="start">开始 / 继续</button><small class="control-hint">拖动标题栏移动 · 收起后继续运行</small></footer>
+    </section>
+    <button id="orb" type="button" aria-label="展开掌握度满分助手" aria-controls="assistant-panel" aria-expanded="false" title="点击展开，拖动移动。仅用于不限次数的掌握度练习。" hidden><span class="orb-inner">${bookIcon}<span id="orb-percent">掌握度</span></span><span class="orb-dot"></span></button>`;
     uiStatus = $('#status', ui); uiLog = $('#log', ui); uiStart = $('#start', ui);
     uiMode = $('#mode', ui); uiDelay = $('#delay', ui); uiProgress = $('#progress', ui); uiProgressBar = $('#progress-bar', ui);
     uiExportCourse = $('#export-course', ui); uiCourseLabel = $('#course-label', ui);
+    uiPanel = $('#assistant-panel', ui); uiOrb = $('#orb', ui);
     uiMode.value = settings.mode; uiDelay.value = settings.delay;
-    $('#fold', ui).onclick = event => { const folded = $('section', ui).classList.toggle('mini'); event.target.textContent = folded ? '展开' : '收起'; };
+    setupFloatingUI();
     uiStart.onclick = () => running || starting ? stop() : start();
     const changeSettings = () => {
       const delay = Number(uiDelay.value);
