@@ -1,19 +1,19 @@
 <!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>知到智慧树掌握度满分助手 v1.5.3 · 完整代码</title>
+<title>知到智慧树掌握度满分助手 v1.5.4 · 完整代码</title>
 <style>body{max-width:920px;margin:40px auto;padding:0 20px;font:17px/1.7 system-ui;background:#f6f7fb;color:#253047}h1{font-size:28px}button{background:#604ffd;color:white;border:0;border-radius:8px;padding:14px 22px;font:inherit;cursor:pointer}textarea{display:block;width:100%;height:320px;box-sizing:border-box;margin:18px 0;font:13px/1.5 monospace}#status{min-height:30px;color:#4835bc}li{margin:10px 0}</style>
-<h1>知到智慧树掌握度满分助手 v1.5.3</h1>
-<p role="note" style="padding:14px 18px;background:#fff1f0;color:#a61b1b;border:2px solid #d92d20;border-radius:8px;font-weight:700">警告：本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负</p>
+<h1>知到智慧树掌握度满分助手 v1.5.4</h1>
+<div role="note" style="padding:14px 18px;background:#fff1f0;color:#a61b1b;border:2px solid #d92d20;border-radius:8px"><strong>警告：本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负</strong><p style="margin:8px 0 0">脚本不会自动识别课程是否限制答题次数，请在启动前自行确认。</p></div>
 <p>作者：Watson · MIT 许可</p>
 <p>此页面包含经过语法检查的完整脚本。按以下步骤更新原来的脚本条目，保留答案记录和设置。</p>
-<ol><li>点击下方“复制完整脚本”。</li><li>进入篡改猴中原脚本的<strong>代码编辑区</strong>，先点击代码，再按 <strong>Ctrl+A</strong> 全选，按 <strong>Ctrl+V</strong> 整体替换，然后按 <strong>Ctrl+S</strong> 保存。</li><li>刷新智慧树页面。悬浮窗标题显示 <strong>v1.5.3</strong>，即可确认新代码已运行。</li></ol>
+<ol><li>点击下方“复制完整脚本”。</li><li>进入篡改猴中原脚本的<strong>代码编辑区</strong>，先点击代码，再按 <strong>Ctrl+A</strong> 全选，按 <strong>Ctrl+V</strong> 整体替换，然后按 <strong>Ctrl+S</strong> 保存。</li><li>刷新智慧树页面。悬浮窗标题显示 <strong>v1.5.4</strong>，即可确认新代码已运行。</li></ol>
 <button id="copy">复制完整脚本</button><p id="status" role="status">请整体替换，不要将新代码追加到旧代码后面。无需删除原脚本或清除数据。</p>
 <textarea id="source" aria-label="完整脚本代码" readonly spellcheck="false">// ==UserScript==
 // @name         知到智慧树掌握度满分助手
 // @author       Watson
 // @namespace    local.zhihuishu.mastery.practice
-// @version      1.5.3
-// @description  掌握度练习：仅跳过免考和100%掌握度，逐题尝试至全对，显示满分进度，支持按课程导出题库。
+// @version      1.5.4
+// @description  仅用于智慧树掌握度练习：自动选择、提交并按批改重答至全对，仅跳过免考和100%；显示满分进度，按课程学习多选分布并导出题库。
 // @match        https://studywisdomh5.zhihuishu.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -23,6 +23,7 @@
 // @noframes
 // @license      MIT
 // 警告：本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负
+// 提示：脚本不会自动识别课程是否限制答题次数，请在启动前自行确认。
 // ==/UserScript==
 
 (function () {
@@ -55,11 +56,9 @@
     for (let i = 1; i &lt;= k; i++) value = value * (n - i + 1) / i;
     return value;
   }
-  function answerModel(records, useCoursePrior = false) {
+  function answerModel(records) {
     const model = {};
-    // 此课程导出的 46 道已解五选题：选 2/3/4/5 项分别为 1/28/16/1。
-    // 缩为 20 道的先验权重，新增实际答案仍能逐渐改变分布。其他课程不使用。
-    if (useCoursePrior) model[5] = { 2: 20 / 46, 3: 560 / 46, 4: 320 / 46, 5: 20 / 46 };
+    // 所有课程统一仅使用本课程已确认答案，不含课程专用 ID 或预置分布。
     const seen = new Set();
     for (const [key, record] of Object.entries(records || {})) {
       if (record.type !== '多选题' || !record.correct?.length) continue;
@@ -288,7 +287,6 @@
   let uiExportCourse, uiCourseLabel, lastExportPageCourse = '', courseOptionSignature = '';
   let metadataRoute = '', metadataSince = Date.now();
   const courseLogs = {};
-  const PRIOR_COURSE = '4e5f5a5944594859454a585958435b4a5b';
 
   const $ = (selector, root = document) =&gt; root.querySelector(selector);
   const $$ = (selector, root = document) =&gt; [...root.querySelectorAll(selector)];
@@ -400,7 +398,7 @@
     loadMasteryChecks(courseId()).entries[key] = { rate, color };
     saveMasteryChecks();
   }
-  function currentModel() { return answerModel(db.questions, dbCourse === PRIOR_COURSE); }
+  function currentModel() { return answerModel(db.questions); }
   function refreshProgress() {
     if (!ui || !courseId()) return;
     try {
@@ -792,10 +790,11 @@
       button,select,input{font:inherit}button{cursor:pointer;border:1px solid #d9ddea;background:#f7f8fc;border-radius:6px;padding:6px 9px;color:#253047}button:disabled{opacity:.6;cursor:default}
       header button{color:white;border:0;background:transparent;padding:0 4px}main{padding:12px}p{margin:0 0 8px;white-space:pre-wrap;overflow-wrap:anywhere}progress{width:100%;height:9px;accent-color:#00bd85;margin-bottom:8px}#progress{font-size:12px;color:#3b6355}
       .usage-warning{padding:9px 12px;background:#fff1f0;color:#a61b1b;border-bottom:1px solid #ffc9c3;font-size:12px;line-height:1.6}
+      .usage-warning p{margin:6px 0 0}
       label{display:block;margin:8px 0}select{width:100%;padding:5px;border:1px solid #d9ddea;border-radius:5px;background:#fff}input[type=number]{width:80px;padding:3px}
       .actions{display:flex;gap:7px;flex-wrap:wrap}.primary{background:#604ffd;color:white;border-color:#604ffd}pre{font:11px/1.6 monospace;white-space:pre-wrap;max-height:140px;overflow:auto;background:#f5f6fb;padding:8px;border-radius:6px;margin:10px 0 0}small{color:#737c8e}section.mini main{display:none}
-    &lt;/style&gt;&lt;section&gt;&lt;header&gt;知到智慧树掌握度满分助手 v1.5.3 &lt;button id="fold"&gt;收起&lt;/button&gt;&lt;/header&gt;
-      &lt;aside class="usage-warning" role="note"&gt;&lt;strong&gt;警告：&lt;/strong&gt;本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负&lt;/aside&gt;&lt;main&gt;
+    &lt;/style&gt;&lt;section&gt;&lt;header&gt;知到智慧树掌握度满分助手 v1.5.4 &lt;button id="fold"&gt;收起&lt;/button&gt;&lt;/header&gt;
+      &lt;aside class="usage-warning" role="note"&gt;&lt;strong&gt;警告：&lt;/strong&gt;本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负&lt;p&gt;脚本不会自动识别课程是否限制答题次数，请在启动前自行确认。&lt;/p&gt;&lt;/aside&gt;&lt;main&gt;
       &lt;p id="status"&gt;&lt;/p&gt;&lt;p id="progress"&gt;&lt;/p&gt;&lt;progress id="progress-bar" aria-label="可练习知识点满分进度" max="1" value="0"&gt;&lt;/progress&gt;&lt;label&gt;&lt;select id="mode"&gt;&lt;option value="all"&gt;全部知识点：仅跳过免考和100%&lt;/option&gt;&lt;option value="current"&gt;当前知识点：本轮全对后停止&lt;/option&gt;&lt;/select&gt;&lt;/label&gt;
       &lt;label&gt;操作间隔 &lt;input id="delay" type="number" min="0" max="10000" step="50"&gt; 毫秒&lt;/label&gt;
       &lt;small style="display:block;margin:0 0 8px"&gt;操作间隔为选项切换、悬浮弹窗和页面更新提供响应时间，如流畅运行可尝试更低值&lt;/small&gt;
