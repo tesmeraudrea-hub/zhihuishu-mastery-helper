@@ -2,7 +2,7 @@
 // @name         知到智慧树掌握度满分助手
 // @author       Watson
 // @namespace    local.zhihuishu.mastery.practice
-// @version      1.8.1
+// @version      1.10.0
 // @description  智慧树掌握度练习与题库完善：自动作答、按批改纠错，支持满分后复练、TXT题库导入导出、课程独立记录、拖动悬浮球及内置使用帮助。仅用于不限次数的掌握度练习。
 // @match        https://studywisdomh5.zhihuishu.com/*
 // @grant        GM_getValue
@@ -456,8 +456,47 @@
     }
     return [...new Map(matches.sort((a, b) => b.score - a.score).map(item => [JSON.stringify(item.choice), item.choice])).values()];
   }
+  function searchQuestionBank(records, query) {
+    const terms = normalize(query).split(' ').map(matchText).filter(Boolean);
+    if (!terms.length) return [];
+    const phrase = terms.join('');
+    const groups = new Map();
+    function add(type, title, options, answers, source) {
+      if (!title || !options.length || options.some(option => !option)) return;
+      const stem = matchText(title), searchable = [stem, ...options.map(matchText)];
+      if (!terms.every(term => searchable.some(field => field.includes(term)))) return;
+      const key = JSON.stringify([type, normalize(title), canonical(options)]);
+      if (!groups.has(key)) groups.set(key, { type, title, options, verified: [], imported: [],
+        rank: stem === phrase ? 3 : stem.includes(phrase) ? 2 : terms.every(term => stem.includes(term)) ? 1 : 0 });
+      const result = groups.get(key);
+      for (const answer of answers) {
+        if (!result[source].some(previous => same(previous, answer))) result[source].push(answer);
+      }
+    }
+    const displayText = (type, value) => {
+      const label = normalize(value).replace(/\s+\[ID:[^\]]*\]$/, '');
+      const truth = type === '判断题' ? truthToken(label) : null;
+      return truth === 'true' ? '对' : truth === 'false' ? '错' : label;
+    };
+    for (const question of Object.values(questionBankFromRecords(records?.questions).questions)) {
+      const { type, title, latestOptions, correctAnswerTokens } = question;
+      if (!correctAnswerTokens?.length || !Array.isArray(latestOptions)) continue;
+      const labels = new Map(latestOptions.filter(Boolean).map(option => {
+        const label = displayText(type, option.content ?? option.token);
+        const images = (option.images || []).map(image => image.src).filter(Boolean);
+        return [option.token, images.length && !label.includes('[图片:') ? `${label} [图片:${images.join('|')}]` : label];
+      }));
+      if ((type !== '多选题' && correctAnswerTokens.length !== 1) || labels.size !== latestOptions.length || !correctAnswerTokens.every(token => labels.get(token))) continue;
+      add(type, title, [...labels.values()], [correctAnswerTokens.map(token => labels.get(token))], 'verified');
+    }
+    for (const item of records?.imported || []) {
+      const label = value => displayText(item.type, value);
+      add(item.type, item.title, item.options.map(label), item.answers.map(answer => answer.map(label)), 'imported');
+    }
+    return [...groups.values()].sort((a, b) => b.rank - a.rank || Number(!!b.verified.length) - Number(!!a.verified.length));
+  }
   if (typeof module === 'object' && module.exports) {
-    module.exports = { normalize, same, combinations, questionKey, nextAnswer, remember, masteryURL, identifyPage, binomial, answerModel, rankedCombinations, masteryProgress, parseMasteryRate, snapshotQuestion, questionBankFromRecords, formatTextBank, formatExcludedBankReport, extractCourseName, courseFileName, recordsForCourse, parseTextBank, parseJSONBank, parseBankFile, mergeImported, importedCandidates, textSimilarity, newReview, questionIdentity, reviewProgress, trackReview, reconcileFeedback };
+    module.exports = { normalize, same, combinations, questionKey, nextAnswer, remember, masteryURL, identifyPage, binomial, answerModel, rankedCombinations, masteryProgress, parseMasteryRate, snapshotQuestion, questionBankFromRecords, formatTextBank, formatExcludedBankReport, extractCourseName, courseFileName, recordsForCourse, parseTextBank, parseJSONBank, parseBankFile, mergeImported, importedCandidates, searchQuestionBank, textSimilarity, newReview, questionIdentity, reviewProgress, trackReview, reconcileFeedback };
     return;
   }
 
@@ -466,6 +505,7 @@
   const SETTINGS = PREFIX + 'settings';
   const COURSES = PREFIX + 'courses';
   const UI_SETTINGS = PREFIX + 'ui';
+  const PROGRESS_REFRESH = PREFIX + 'progress-refresh';
   const SELECTORS = {
     cards: '.mastery-content-right .chunk-list .item-box',
     cardName: '.item-box-name',
@@ -493,6 +533,10 @@
   let stagedImport = null, importBusy = false, importClearCourse = '', candidateSignature = '';
   const candidateCache = new Map();
   let currentTab = 'practice', previousTab = 'practice', bankSummarySignature = '', resetReviewRequested = false;
+  let bankSearchLimit = 8, lastBankSearch = {};
+  let importedNotice = null;
+  let refreshing = false, practiceStatus = '待启动', bankStatus = '';
+  const practiceLogs = [], bankLogs = [];
   const improving = () => settings.activity === 'bank';
   const coldReview = () => improving() && db?.review?.ignoreAnswers === true;
 
@@ -573,7 +617,8 @@
       uiExportCourse.replaceChildren();
       for (const course of Object.values(courses)) {
         const option = document.createElement('option'); option.value = course.id;
-        option.textContent = `${course.name || '未识别课程'} [${course.id}]${course.id === id ? '（当前）' : ''}`;
+        option.textContent = `${course.name || '未命名课程 ' + course.id}${course.id === id ? '（当前课程）' : ''}`;
+        option.title = `课程 ID：${course.id}`;
         uiExportCourse.append(option);
       }
       if (courses[selected]) uiExportCourse.value = selected;
@@ -608,19 +653,58 @@
     if (!ui) return;
     const id = uiExportCourse.value || courseId();
     const records = id ? GM_getValue(PREFIX + id, null) : null;
-    $('#import-summary', ui).textContent = `所选课程导入候选：${records?.imported?.length || 0} 题。导入答案经网站判对后才进入正式题库。`;
+    const imported = records?.imported?.length || 0;
+    $('#import-summary', ui).textContent = imported ? `已载入 ${imported} 道参考题。已做对且内容完整的题目，会计入上方可导出数量。` : '有别人分享的 TXT 题库？导入后，脚本会优先尝试其中的答案。';
     const signature = JSON.stringify([id, records?.questions, records?.importRevision]);
     if (signature !== bankSummarySignature) {
       bankSummarySignature = signature;
       const bank = formatTextBank(questionBankFromRecords(records?.questions || {}));
       $('#bank-count', ui).textContent = bank.exported;
-      $('#bank-quality', ui).textContent = `待确认 ${bank.unconfirmed} · 数据不完整 ${bank.incomplete} · 答案冲突 ${bank.conflicts} 组`;
+      $('#bank-quality', ui).textContent = bank.exported ? '这些题已经在网站上做对，可以导出分享。' : '练习做对的题目会自动存到这里。';
+      $('#bank-issues', ui).textContent = `尚未答对 ${bank.unconfirmed} 题 · 内容不完整 ${bank.incomplete} 题 · 答案冲突 ${bank.conflicts} 组`;
+      $('#export-bank', ui).disabled = !bank.exported;
     }
+    if (currentTab === 'bank') renderBankSearch(records, signature);
+  }
+  function renderBankSearch(records, signature) {
+    const query = normalize($('#bank-search', ui).value);
+    if (lastBankSearch.signature !== signature || lastBankSearch.query !== query) {
+      lastBankSearch = { signature, query, results: searchQuestionBank(records, query) };
+    } else if (lastBankSearch.limit === bankSearchLimit) return;
+    lastBankSearch.limit = bankSearchLimit;
+    const { results } = lastBankSearch;
+    const visible = results.slice(0, bankSearchLimit);
+    $('#bank-search-status', ui).textContent = !query ? '' : !results.length ? '所选课程没有匹配的题目。试试更短的关键词。' :
+      `找到 ${results.length} 道题${visible.length < results.length ? `，已显示 ${visible.length} 道` : ''}`;
+    $('#bank-search-more', ui).hidden = visible.length >= results.length;
+    const make = (tag, text, className) => {
+      const node = document.createElement(tag);
+      node.textContent = text;
+      if (className) node.className = className;
+      return node;
+    };
+    const list = $('#bank-search-results', ui);
+    list.replaceChildren(...visible.map(result => {
+      const card = make('li', '', 'bank-search-card');
+      card.append(make('span', result.type, 'bank-search-type'), make('h3', result.title));
+      const options = make('ul', '', 'bank-search-options');
+      options.append(...result.options.map(option => make('li', option)));
+      card.append(options);
+      const answers = (groups, label, className) => {
+        if (!groups.length) return;
+        const line = make('p', '', className);
+        line.append(make('strong', label + '：'), groups.map(group => group.join('、')).join('；或 '));
+        card.append(line);
+      };
+      answers(result.verified, result.verified.length > 1 ? '已验证记录有冲突' : '已验证答案', 'bank-search-verified');
+      answers(result.imported, '导入参考（未验证）', 'bank-search-reference');
+      return card;
+    }));
   }
   async function previewBankFile(file) {
-    if (running || starting || busy || importBusy) { log('请先暂停，待当前操作结束后再导入题库'); return; }
+    if (running || starting || busy || importBusy) { logBank('请先暂停，待当前操作结束后再导入题库'); return; }
     const id = uiExportCourse.value || courseId();
-    if (!id) { log('请先打开课程，再选择导入目标'); return; }
+    if (!id) { logBank('请先打开课程，再选择导入目标'); return; }
     stagedImport = null;
     $('#import-preview', ui).hidden = true;
     importBusy = true; render();
@@ -645,17 +729,17 @@
       $('#import-preview', ui).hidden = false;
       $('#import-confirm', ui).disabled = !parsed.items.length;
       $('#import-report', ui).disabled = !parsed.excluded.length;
-      log(`题库预览已准备：可用 ${parsed.items.length} 题，请核对目标课程后确认导入`);
-    } catch (error) { log(`读取题库失败：${error.message}`); }
+      logBank(`题库预览已准备：可用 ${parsed.items.length} 题，请核对目标课程后确认导入`);
+    } catch (error) { logBank(`读取题库失败：${error.message}`); }
     finally { importBusy = false; render(); }
   }
   async function changeImportedBank(clear = false) {
-    if (running || starting || busy || importBusy) { log('请先暂停，待当前操作结束后再修改导入题库'); return; }
+    if (running || starting || busy || importBusy) { logBank('请先暂停，待当前操作结束后再修改导入题库'); return; }
     const id = uiExportCourse.value || courseId();
-    if (!id || (clear ? importClearCourse !== id : !stagedImport || stagedImport.id !== id)) { log('目标课程已改变，请重新预览或确认目标课程'); return; }
+    if (!id || (clear ? importClearCourse !== id : !stagedImport || stagedImport.id !== id)) { logBank('目标课程已改变，请重新预览或确认目标课程'); return; }
     const course = GM_getValue(COURSES, {})[id] || { id, name: '' };
     const incoming = clear ? [] : stagedImport.parsed.items;
-    if (!navigator.locks) { log('浏览器不支持运行锁，请使用新版 Edge / Chrome'); return; }
+    if (!navigator.locks) { logBank('浏览器不支持运行锁，请使用新版 Edge / Chrome'); return; }
     importBusy = true; render();
     try {
       await navigator.locks.request(PREFIX + id, { ifAvailable: true }, async lock => {
@@ -671,9 +755,10 @@
         candidateCache.clear();
         stagedImport = null; $('#import-preview', ui).hidden = true;
         importClearCourse = ''; $('#import-clear-preview', ui).hidden = true;
-        log(clear ? `[${course.name || id}] 导入候选题库已清除，已确认答案保留` : `[${course.name || id}] 已合并导入：新增 ${merged.added} 题、${merged.addedAnswers} 个候选答案，重复 ${merged.duplicates} 个，冲突 ${merged.conflicts} 组`, id);
+        importedNotice = clear ? null : { id, count: incoming.length, added: merged.added };
+        logBank(clear ? `[${course.name || id}] 导入候选题库已清除，已确认答案保留` : `[${course.name || id}] 已合并导入：新增 ${merged.added} 题、${merged.addedAnswers} 个候选答案，重复 ${merged.duplicates} 个，冲突 ${merged.conflicts} 组`, id);
       });
-    } catch (error) { log(`题库修改失败：${error.message}`); }
+    } catch (error) { logBank(`题库修改失败：${error.message}`); }
     finally { importBusy = false; refreshImportSummary(); render(); }
   }
   function loadMasteryChecks(course) {
@@ -692,6 +777,101 @@
   function recordMasteryRate(key, rate, color) {
     loadMasteryChecks(courseId()).entries[key] = { rate, color };
     saveMasteryChecks();
+  }
+  function saveProgressSnapshot(course, progress) {
+    // 只更新掌握度，不用旧内存答案覆盖其他页面刚保存的题库或答卷。
+    const latest = GM_getValue(PREFIX + course, { version: 1, questions: {}, rounds: {}, pending: null });
+    if (latest?.version !== 1 || !latest.questions || !latest.rounds) throw new Error('课程记录格式异常');
+    latest.progress = progress;
+    GM_setValue(PREFIX + course, latest);
+    if (dbCourse === course) db = latest;
+  }
+  async function clearSelectedCourse() {
+    if (running || starting || busy || importBusy) { logBank('请先暂停后清除记录'); return; }
+    const id = uiExportCourse.value || courseId();
+    if (!id) return;
+    const course = GM_getValue(COURSES, {})[id] || { id, name: '' };
+    if (!confirm(`清除所选课程“${course.name || id}”的本地答案、尝试记录和导入题库？网站成绩不会被修改，其他课程记录保留。`)) return;
+    if (!navigator.locks) { logBank('浏览器不支持运行锁'); return; }
+    importBusy = true; render();
+    try {
+      await navigator.locks.request(PREFIX + id, { ifAvailable: true }, lock => {
+        if (!lock) throw new Error('该课程正在其他标签页运行，请先暂停它');
+        const latest = GM_getValue(PREFIX + id, null);
+        const empty = { version: 1, course, questions: {}, rounds: {}, pending: null, imported: [], importRevision: (Number(latest?.importRevision) || 0) + 1 };
+        GM_setValue(PREFIX + id, empty);
+        if (dbCourse === id) db = empty;
+        if (courseId() === id) { checksCourse = id; checks = { version: 1, entries: {} }; saveMasteryChecks(); }
+        candidateCache.clear(); stagedImport = null; importedNotice = null; importClearCourse = '';
+        $('#import-preview', ui).hidden = true; $('#import-clear-preview', ui).hidden = true;
+        logBank(`[${course.name || id}] 所选课程本地记录与导入题库已清除`, id);
+      });
+    } catch (error) { logBank(`清除未完成：${error.message}`, id); }
+    finally { importBusy = false; refreshImportSummary(); refreshProgress(); render(); }
+  }
+  async function refreshMasteryProgress(reload = true) {
+    if (refreshing) { stop('已取消进度刷新'); return; }
+    if (running || starting || busy || importBusy) { log('请先暂停当前任务，再刷新进度', courseId(), 'practice'); return; }
+    const id = courseId();
+    if (!id) { log('请先打开课程的掌握度页面', id, 'practice'); return; }
+    if (!navigator.locks) { log('浏览器不支持运行锁，请使用新版 Edge / Chrome', id, 'practice'); return; }
+    refreshing = true; busy = true;
+    const ctx = { generation: ++generation, url: location.href, refresh: true, course: id };
+    let cards = null;
+    log(reload ? '正在重新载入热力图，随后核实最新掌握度…' : '正在刷新进度：只读取掌握度，不会作答或提交', id, 'practice');
+    try {
+      await navigator.locks.request(PREFIX + id, { ifAvailable: true }, async lock => {
+        if (!lock) throw new Error('此课程正在其他标签页运行，请先暂停它');
+        guard(ctx);
+        if (reload) {
+          sessionStorage.removeItem(SESSION);
+          sessionStorage.setItem(PROGRESS_REFRESH, JSON.stringify({ course: id, at: Date.now() }));
+          location.assign(masteryURL(ctx.url));
+          return;
+        }
+        await waitFor(() => page() === 'mastery' && $$(SELECTORS.cards).length, ctx, 25000);
+        await pause(1000, ctx);
+        cards = $$(SELECTORS.cards);
+        try {
+          checksCourse = id; checks = { version: 1, entries: {} }; saveMasteryChecks();
+          saveProgressSnapshot(id, masteryProgress(cards.map(cardColor)));
+          refreshProgress();
+          for (const [index, card] of cards.entries()) {
+            guard(ctx);
+            if (!card.isConnected) throw new Error('知识点列表已更新，请重新刷新进度');
+            const color = cardColor(card);
+            if (color === 'blue') continue;
+            if (color === 'unknown') throw new Error('热力图出现未知颜色状态');
+            log(`刷新进度 ${index + 1}/${cards.length}：${textOf($(SELECTORS.cardName, card))}`, id, 'practice');
+            const name = $(SELECTORS.cardName, card);
+            try {
+              const popover = await openPopover(card, ctx);
+              await pause(settings.delay, ctx);
+              const rate = parseMasteryRate(textOf($('.text > span', popover)));
+              if (rate === null) throw new Error('未读到有效掌握度，请稍后重新刷新');
+              recordMasteryRate(cardIdentity(card, index), rate, cardColor(card));
+            } finally {
+              if (name?.isConnected) name.dispatchEvent(new MouseEvent('mouseleave', { bubbles: false }));
+            }
+            refreshProgress();
+          }
+          guard(ctx);
+          const currentCards = $$(SELECTORS.cards);
+          if (currentCards.length !== cards.length || currentCards.some((card, index) => card !== cards[index])) throw new Error('知识点列表已更新，请重新刷新进度');
+          const progress = masteryProgress(cards.map(cardColor), cards.map(checkedRate));
+          log(`进度已刷新：满分 ${progress.perfect}/${progress.eligible}，未满分 ${progress.remaining}，免考 ${progress.exempt}。任务保持暂停。`, id, 'practice');
+        } finally {
+          if (courseId() === id && location.href === ctx.url) {
+            const currentCards = $$(SELECTORS.cards);
+            saveProgressSnapshot(id, masteryProgress(currentCards.map(cardColor), currentCards.map(checkedRate)));
+          }
+        }
+      });
+    } catch (error) {
+      if (refreshing) log(`进度刷新未完成：${error.message}。未核实项目会保留为待检查。`, id, 'practice');
+    } finally {
+      refreshing = false; busy = false; refreshProgress(); render();
+    }
   }
   function currentModel() {
     if (!coldReview()) return answerModel(db.questions);
@@ -721,28 +901,25 @@
         if (JSON.stringify(db.progress) !== JSON.stringify(snapshot)) { db.progress = snapshot; if (running) save(); }
       }
       let progress = db.progress?.perfect !== undefined ? db.progress : null;
-      $('#progress-title', ui).textContent = improving() ? '本轮已完成复练' : '已确认满分';
-      $('#review-stats', ui).hidden = !improving();
-      $('#new-review', ui).hidden = !improving();
-      if (improving()) {
-        const review = db.review;
-        const stats = reviewProgress(review, progress?.eligible || 0);
-        $('#review-added', ui).textContent = stats.added;
-        $('#review-verified', ui).textContent = stats.verified;
-        $('#review-corrected', ui).textContent = stats.corrected;
-        $('#review-unresolved', ui).textContent = stats.unresolved;
-        progress = progress ? { ...progress, perfect: stats.completed, percent: stats.percent, remaining: Math.max(0, stats.eligible - stats.completed), unchecked: 0 } : null;
-        $('#review-note', ui).textContent = !review ? '尚未开始。即使已满分，也会实际答题一轮。' : review.finishedAt ? '本轮已结束。可导出题库，或开始新一轮继续收集。' : `本轮始于 ${new Date(review.startedAt).toLocaleString('zh-CN')}，暂停或刷新后继续。${review.ignoreAnswers ? '正在忽略运行前已有答案。' : ''}`;
-      }
+      $('#progress-title', ui).textContent = '本课程满分进度';
       uiProgress.textContent = progress ? `免考 ${progress.exempt} · 剩余 ${progress.remaining} · 尚待核实 ${progress.unchecked}${cards.length ? '' : '\n最近一次热力图核实结果'}` : '等待热力图核实掌握度';
-      if (improving() && progress) uiProgress.textContent = `免考 ${progress.exempt} · 本轮剩余 ${progress.remaining} · 每个知识点答至全对`;
+      // 未核实的知识点不能算成未满分，避免初次打开显示误导性的 0%。
+      const unchecked = !progress || progress.unchecked > 0;
+      const waiting = unchecked && !progress?.verified;
       $('#completed-count', ui).textContent = progress ? progress.perfect : '—';
       $('#total-count', ui).textContent = progress ? progress.eligible : '—';
-      $('#progress-percent', ui).textContent = progress ? `${progress.percent}%` : '—';
-      $('#orb-percent', ui).textContent = progress ? `${progress.percent}%` : '掌握度';
+      $('#progress-percent', ui).textContent = unchecked ? (progress?.verified ? '核实中' : '待检查') : progress ? `${progress.percent}%` : '待检查';
+      $('#progress-empty', ui).hidden = !waiting;
+      $('#progress-empty strong', ui).textContent = refreshing || running || starting ? '正在检查进度' : '准备开始';
+      $('#progress-numbers', ui).hidden = waiting;
+      uiProgressBar.hidden = waiting;
+      if (unchecked) uiProgress.textContent = progress?.perfect ? `已确认 ${progress.perfect} 个满分，另有 ${progress.unchecked} 个待检查。` : '开始后检查已有进度，自动跳过免考和满分项。';
+      else if (progress) uiProgress.textContent = progress.remaining ? `还有 ${progress.remaining} 个知识点未满分 · 免考 ${progress.exempt} 个` : `可练习的 ${progress.eligible} 个知识点均已满分 · 免考 ${progress.exempt} 个`;
+      $('#orb-percent', ui).textContent = running || starting ? '运行中' : '已暂停';
       uiOrb.style.setProperty('--orb-progress', `${progress?.percent || 0}%`);
       uiProgressBar.max = progress?.eligible || 1;
       uiProgressBar.value = progress?.perfect || 0;
+      if (typeof render === 'function') render();
     } catch (error) { uiProgress.textContent = `总进度暂不可用：${error.message}`; }
   }
   function recordFor(question) {
@@ -754,50 +931,91 @@
   }
   function render() {
     if (!ui) return;
-    const state = running ? 'running' : starting ? 'starting' : 'paused';
-    const stateLabel = running ? '运行中' : starting ? '准备中' : '已暂停';
+    const active = running || starting;
+    const locked = active || busy || importBusy || refreshing;
+    const progress = dbCourse === courseId() ? db?.progress : null;
+    const review = dbCourse === courseId() ? db?.review : null;
+    const complete = Boolean(progress?.total && progress.unchecked === 0 && progress.remaining === 0);
+    const practiceActive = active && !improving(), reviewActive = active && improving();
+    const state = running ? 'running' : starting || refreshing ? 'starting' : 'paused';
+    const stateLabel = refreshing ? '正在刷新进度' : running ? (improving() ? '正在补充题库' : '正在练习') : starting ? '正在准备' : '已暂停';
     uiPanel.dataset.state = uiOrb.dataset.state = state;
-    $('#run-state', ui).textContent = stateLabel;
-    uiStatus.textContent = `${status}${activeName ? '\n' + activeName : ''}`;
-    $('#bank-status', ui).textContent = status;
+    $('#run-state', ui).textContent = refreshing ? '正在刷新进度' : practiceActive ? stateLabel : complete ? '已满分 · 已暂停' : practiceStatus === '待启动' ? '准备就绪' : '已暂停';
+    uiStatus.textContent = reviewActive ? '补充题库正在运行，请在“我的题库”暂停后再开始练习。' : practiceStatus === '待启动' ? (complete ? '本课程已满分。手动作答后，可刷新进度或继续练习。' : courseId() ? '已识别当前课程，可以开始。' : '请先打开课程的掌握度热力图。') : `${activeName && practiceActive ? activeName + '\n' : ''}${practiceStatus}`;
+    $('#bank-status', ui).textContent = !uiExportCourse.value || uiExportCourse.value === courseId() ? bankStatus : '';
     uiStatus.title = uiStatus.textContent;
     uiOrb.setAttribute('aria-label', `展开掌握度满分助手，${stateLabel}`);
-    uiStart.textContent = running || starting ? '暂停' : '开始 / 继续';
-    uiStart.disabled = importBusy;
-    uiMode.disabled = running || starting || improving();
-    $('#activity', ui).disabled = running || starting || busy || importBusy;
-    $('#ignore-answers', ui).disabled = running || starting || busy;
-    uiMode.value = improving() ? 'all' : settings.mode;
-    uiMode.options[0].textContent = improving() ? '全部非免考知识点（包括已满分）' : '全部知识点：仅跳过免考和100%';
-    $('#new-review', ui).disabled = running || starting || busy || importBusy;
-    $('#review-reset-confirm', ui).disabled = running || starting || busy || importBusy;
-    $('#cold-setting', ui).hidden = !improving();
-    $('#mode-hint', ui).textContent = improving() ? '忽略网站已有满分，复核答案并补充新题。遍历一轮后停止。' : '跳过免考和已确认 100% 的知识点，其余答至全对。';
-    $('#help-context', ui).textContent = improving() ? '当前：题库完善。每个非免考知识点实际答至全对，本轮完成后停止；不会以旧满分结果代替复核。' : '当前：满分练习。核实掌握度，仅跳过免考与 100%。制作更完整的题库可切换到“题库完善”。';
-    $('.control-hint', ui).textContent = `${stateLabel} · ${improving() ? '题库完善' : '满分练习'} · 收起后继续运行`;
-    for (const id of ['import-bank', 'import-clear', 'import-match']) $('#' + id, ui).disabled = running || starting || importBusy;
-    $('#import-confirm', ui).disabled = running || starting || importBusy || !stagedImport?.parsed.items.length;
+    $('#orb-percent', ui).textContent = refreshing ? '刷新中' : active ? '运行中' : '已暂停';
+    uiStart.textContent = practiceActive ? '暂停练习' : complete || practiceStatus !== '待启动' ? '继续练习' : '开始练习';
+    uiStart.disabled = !practiceActive && locked;
+    $('.control-bar', ui).hidden = currentTab !== 'practice';
+    $('#bank-controls', ui).hidden = currentTab !== 'bank';
+    $('#refresh-progress', ui).textContent = refreshing ? '取消刷新' : '刷新进度';
+    $('#refresh-progress', ui).disabled = !refreshing && locked;
+    $('#refresh-note', ui).textContent = refreshing ? '只读取最新掌握度，刷新结束后保持暂停。' : '刷新会返回并重新载入热力图，核实最新进度，不会答题。';
+    uiMode.disabled = locked;
+    $('#activity', ui).disabled = locked;
+    $('#ignore-answers', ui).disabled = locked || Boolean(review && !review.finishedAt);
+    uiMode.value = settings.mode;
+    uiMode.options[0].textContent = '全部知识点：仅跳过免考和100%';
+    $('#review-reset-confirm', ui).disabled = locked;
+    const selectedIsCurrent = Boolean(courseId()) && (!uiExportCourse.value || uiExportCourse.value === courseId());
+    const bankRecords = selectedIsCurrent ? db : GM_getValue(PREFIX + uiExportCourse.value, null);
+    const bankReview = bankRecords?.review;
+    const stats = reviewProgress(bankReview, bankRecords?.progress?.eligible || 0);
+    $('#review-title', ui).textContent = bankReview?.finishedAt ? '本轮题库检查已完成' : bankReview ? '继续检查答案、收集新题' : '重新练习，补充题库';
+    $('#begin-review', ui).textContent = reviewActive && selectedIsCurrent ? '暂停补充题库' : bankReview?.finishedAt ? '再检查一轮' : bankReview ? '继续补充题库' : '开始补充题库';
+    $('#begin-review', ui).disabled = !selectedIsCurrent || (!reviewActive && locked);
+    $('#review-progress', ui).hidden = !bankReview;
+    $('#review-progress-count', ui).textContent = `${stats.completed} / ${stats.eligible} 个知识点`;
+    $('#review-progress-bar', ui).max = stats.eligible || 1;
+    $('#review-progress-bar', ui).value = stats.completed;
+    $('#review-state', ui).textContent = reviewActive && selectedIsCurrent ? '正在补充题库' : bankReview?.finishedAt ? '本轮已完成' : '已暂停';
+    $('#review-stats', ui).hidden = !bankReview;
+    for (const key of ['added', 'verified', 'corrected', 'unresolved']) $('#review-' + key, ui).textContent = stats[key];
+    $('#review-note', ui).textContent = !bankReview ? '' : bankReview.finishedAt ? '本轮已结束。可导出题库，或开始新一轮继续收集。' : `本轮始于 ${new Date(bankReview.startedAt).toLocaleString('zh-CN')}，暂停或刷新后继续。${bankReview.ignoreAnswers ? '正在忽略运行前已有答案。' : ''}`;
+    $('#new-review', ui).hidden = !bankReview || Boolean(bankReview.finishedAt);
+    $('#new-review', ui).disabled = locked || !selectedIsCurrent;
+    $('#review-course-hint', ui).hidden = selectedIsCurrent && !practiceActive && !refreshing;
+    $('#review-course-hint', ui).textContent = !selectedIsCurrent ? '请在网站中打开所选课程，再开始补充题库。' : refreshing ? '请等待进度刷新完成。' : '练习正在运行，暂停练习后才能补充题库。';
+    $('#import-success', ui).hidden = !importedNotice || importedNotice.id !== uiExportCourse.value;
+    $('#import-success-text', ui).textContent = importedNotice ? `已导入 ${importedNotice.count} 道参考题（新增 ${importedNotice.added} 道）。练习时会优先尝试这些答案。` : '';
+    $('#use-imported', ui).disabled = false;
+    const known = dbCourse === courseId() && db ? Object.values(db.questions).some(q => q.correct?.length) || db.imported?.length : false;
+    $('#practice-bank-hint', ui).textContent = known ? '已保存的答案会自动优先使用，答错后继续尝试。' : '没有题库也能开始，脚本会逐步尝试并记住正确答案。';
+    $('#practice-next', ui).textContent = '完成未满分的知识点，自动跳过免考和 100% 掌握度项。';
+    $('#help-context', ui).textContent = previousTab === 'bank' ? '导入、导出、补充题库和本轮收集结果，都在“我的题库”中操作。' : '在练习页开始、暂停或刷新进度。没有题库也能用；有题库时会自动使用。';
+    $('.control-hint', ui).textContent = refreshing ? '正在刷新进度，完成后可继续练习' : reviewActive ? '请先在“我的题库”暂停补充任务' : practiceActive ? '收起为悬浮球后，练习仍会继续' : '仅在确认答题次数不限后使用';
+    for (const id of ['import-bank', 'import-clear', 'import-match']) $('#' + id, ui).disabled = locked;
+    $('#import-confirm', ui).disabled = locked || !stagedImport?.parsed.items.length;
     $('#import-report', ui).disabled = importBusy || !stagedImport?.parsed.excluded.length;
-    $('#import-clear-confirm', ui).disabled = running || starting || importBusy || !importClearCourse;
-    uiLog.textContent = logs.slice(-12).join('\n');
-    $('#log-count', ui).textContent = logs.length ? `${Math.min(logs.length, 12)} 条` : '暂无记录';
+    $('#import-clear-confirm', ui).disabled = locked || !importClearCourse;
+    uiLog.textContent = practiceLogs.slice(-12).join('\n');
+    $('#bank-log', ui).textContent = selectedIsCurrent ? bankLogs.slice(-12).join('\n') : '请打开所选课程，查看本次页面的操作记录。';
+    $('#log-count', ui).textContent = practiceLogs.length ? `${Math.min(practiceLogs.length, 12)} 条` : '暂无记录';
     uiLog.scrollTop = uiLog.scrollHeight;
   }
-  function log(message, course = courseId()) {
+  function log(message, course = courseId(), area = refreshing ? 'practice' : improving() ? 'bank' : 'practice') {
     status = message;
+    if (area === 'bank') bankStatus = message;
+    else practiceStatus = message;
     logs.push(`${new Date().toLocaleTimeString('zh-CN', { hour12: false })} ${message}`);
     if (logs.length > 150) logs.shift();
+    const areaLogs = area === 'bank' ? bankLogs : practiceLogs;
+    areaLogs.push(logs.at(-1)); if (areaLogs.length > 150) areaLogs.shift();
     const savedLogs = courseLogs[course] ||= [];
     savedLogs.push(logs.at(-1)); if (savedLogs.length > 150) savedLogs.shift();
     console.info('[知到智慧树掌握度满分助手]', message);
     render();
   }
+  function logBank(message, course = courseId()) { log(message, course, 'bank'); }
   function stop(reason = '已手动暂停') {
+    const area = refreshing ? 'practice' : improving() ? 'bank' : 'practice';
     navigating = false;
-    running = false; starting = false; generation++;
+    running = false; starting = false; refreshing = false; generation++;
     sessionStorage.removeItem(SESSION);
     if (releaseLock) { releaseLock(); releaseLock = null; }
-    log(reason);
+    log(reason, courseId(), area);
   }
   function saveRun() {
     sessionStorage.setItem(SESSION, JSON.stringify({ course: runCourse, activity: settings.activity, mode: settings.mode }));
@@ -820,8 +1038,8 @@
     return matches.filter(el => !matches.some(other => other !== el && el.contains(other)));
   }
   function guard(ctx, navigation = false, allowDialog = false) {
-    if (!running || ctx.generation !== generation) throw new Error('操作已取消');
-    if (courseId() !== runCourse) throw new Error('课程已改变，请重新开始');
+    if (!(ctx.refresh ? refreshing : running) || ctx.generation !== generation) throw new Error('操作已取消');
+    if (courseId() !== (ctx.refresh ? ctx.course : runCourse)) throw new Error('课程已改变，请重新开始');
     if (!navigation && location.href !== ctx.url) throw new Error('页面已改变，已停止当前操作');
     if (challenge()) throw new Error('页面出现需要手动处理的提示，请检查后点击继续');
     if (!allowDialog && dialogs().length) throw new Error('出现弹窗，请手动处理后点击继续');
@@ -1088,7 +1306,7 @@
     }
     if (!target) {
       if (improving()) { db.review.finishedAt = new Date().toISOString(); save(); }
-      refreshProgress(); stop(improving() ? '本轮题库完善已完成，可导出题库；开始新一轮可继续收集新题' : '所有非免考知识点已确认100%掌握度，任务完成'); return;
+      refreshProgress(); stop(improving() ? '本轮题库检查已完成，可到“我的题库”导出；再检查一轮可继续收集新题' : '所有非免考知识点已确认100%掌握度，任务完成'); return;
     }
     selectedCard = cardIdentity(target, targetIndex);
     activeName = textOf($(SELECTORS.cardName, target));
@@ -1152,7 +1370,7 @@
         loadDB(runCourse);
         if (improving()) {
           db.review ||= newReview(settings.ignoreAnswers);
-          if (db.review.finishedAt) { starting = false; releaseLock(); log('本轮已完成，请点击“开始新一轮”继续完善题库'); return; }
+          if (db.review.finishedAt) { starting = false; releaseLock(); log('本轮已完成，请到“我的题库”点击“再检查一轮”'); return; }
           $('#ignore-answers', ui).checked = db.review.ignoreAnswers;
           save();
         }
@@ -1188,6 +1406,32 @@
     $('#help-toggle', ui).setAttribute('aria-expanded', String(tab === 'help'));
     $('main', ui).scrollTop = 0;
     if (floatingState) { floatingState.tab = tab; floatingState.previousTab = previousTab; saveFloatingState(); }
+    if (tab === 'bank') refreshImportSummary();
+    render();
+  }
+  function selectActivity(activity) {
+    if (running || starting || busy || importBusy) return false;
+    settings.activity = activity;
+    $('#activity', ui).value = activity;
+    GM_setValue(SETTINGS, settings); candidateCache.clear();
+    resetReviewRequested = false; $('#review-reset', ui).hidden = true;
+    refreshProgress(); render();
+    return true;
+  }
+  function beginReview() {
+    if ((running || starting) && improving()) { stop(); return; }
+    if (uiExportCourse.value && uiExportCourse.value !== courseId()) return;
+    if (!selectActivity('bank')) return;
+    if (db?.review?.finishedAt) {
+      resetReviewRequested = courseId(); $('#review-reset', ui).hidden = false;
+      $('#review-reset', ui).scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    showTab('bank'); start();
+  }
+  function beginPractice() {
+    if ((running || starting) && !improving()) { stop(); return; }
+    if (selectActivity('practice')) start();
   }
   async function resetReview() {
     if (!resetReviewRequested || running || starting || busy || importBusy || !courseId()) return;
@@ -1207,16 +1451,18 @@
       });
     } catch (error) { log(`新一轮未开始：${error.message}`); }
     finally { importBusy = false; refreshProgress(); render(); }
-    if (ready) start();
+    if (ready) { selectActivity('bank'); showTab('bank'); start(); }
   }
   function saveFloatingState() { GM_setValue(UI_SETTINGS, floatingState); }
   function placeFloatingUI(position) {
+    const viewportWidth = document.documentElement.clientWidth || innerWidth;
+    uiPanel.style.maxWidth = Math.max(0, viewportWidth - 24) + 'px';
     const target = floatingState.collapsed ? uiOrb : uiPanel;
     const rect = target.getBoundingClientRect();
     const key = floatingState.collapsed ? 'orb' : 'panel';
     const point = position || floatingState[key] || { x: 18, y: innerHeight - rect.height - 18 };
     const margin = 12;
-    const maxX = Math.max(0, innerWidth - rect.width - margin);
+    const maxX = Math.max(0, viewportWidth - rect.width - margin);
     const maxY = Math.max(0, innerHeight - rect.height - margin);
     const x = Math.min(maxX, Math.max(Math.min(margin, maxX), point.x));
     const y = Math.min(maxY, Math.max(Math.min(margin, maxY), point.y));
@@ -1300,98 +1546,101 @@
     const bookIcon = svg('<path d="M12 6v14M3 4h5a4 4 0 0 1 4 3 4 4 0 0 1 4-3h5v14h-5a4 4 0 0 0-4 2 4 4 0 0 0-4-2H3Z"/>');
     const downIcon = svg('<path d="m7 10 5 5 5-5"/>');
     ui.innerHTML = `<style>
-      :host{all:initial;display:block;font:13px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#24253d}
-      *{box-sizing:border-box} [hidden]{display:none!important}button,input,select{font:inherit}button,summary{cursor:pointer}svg{width:20px;height:20px;flex-shrink:0}
-      button{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid #e5e5ef;border-radius:11px;background:#fff;color:#414258;min-height:38px;padding:8px 12px;transition:background .15s,box-shadow .15s,transform .15s}
-      button:hover{background:#f3f1ff;border-color:#d4cffb}button:active{transform:translateY(1px)}button:disabled{opacity:.5;cursor:default}
-      button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #b7abfa;outline-offset:3px}
-      .panel{width:min(380px,calc(100vw - 24px));max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px);display:flex;flex-direction:column;border:1px solid #ffffffd9;border-radius:22px;background:#fcfcff;box-shadow:0 20px 65px #23234026,0 3px 12px #23234012;overflow:hidden}
-      .panel-header{display:flex;align-items:center;gap:11px;padding:16px 18px;background:linear-gradient(120deg,#fff,#f3f0ff);border-bottom:1px solid #ece9f7;cursor:grab;touch-action:none;user-select:none}
-      :host([data-dragging="true"]) .panel-header,:host([data-dragging="true"]) #orb{cursor:grabbing}
-      .brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:13px;background:linear-gradient(145deg,#8874ff,#6050dc);color:#fff;box-shadow:0 4px 12px #6756dd30}
-      .brand-mark svg{width:23px;height:23px}.identity{flex:1;min-width:0}.identity h1{font-size:14px;line-height:1.5;margin:0;font-weight:750;letter-spacing:-.2px}
-      .identity small{display:flex;gap:8px;align-items:center;color:#8b89a0;font-size:10px;margin-top:2px}.version{color:#7466be}
-      #fold{width:32px;min-height:32px;border-radius:10px;padding:0;border:0;background:#ffffffb3;color:#80779e}
-      .usage-warning{margin:0;padding:11px 18px;background:#fff5f3;border-bottom:1px solid #f9e4df;color:#a94437;font-size:11px;line-height:1.65;flex-shrink:0}.usage-warning strong{font-weight:700}.usage-warning p{margin:4px 0 0;color:#ad6055}
-      main{padding:17px 18px;overflow-y:auto;min-height:0;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#d5d1e8 transparent}
-      .progress-card{border:1px solid #e7e3fa;background:linear-gradient(130deg,#f7f4ff,#fcfbff);border-radius:17px;padding:15px;margin-bottom:14px}
-      .progress-heading{display:flex;justify-content:space-between;align-items:center;color:#686080;font-size:11px;font-weight:600;letter-spacing:.4px}
-      #progress-percent{color:#6c53d9;background:#ece6ff;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700}
-      .progress-metric{display:flex;align-items:baseline;gap:7px;margin:7px 0 8px}.progress-metric strong{font-size:36px;line-height:1.2;font-weight:750;letter-spacing:-1.5px;color:#413176}.progress-metric span{color:#736881;font-size:12px}
-      progress{display:block;appearance:none;width:100%;height:7px;border:0;border-radius:10px;overflow:hidden;background:#e8e4f4;accent-color:#7963e8}
-      progress::-webkit-progress-bar{background:#e8e4f4;border-radius:10px}progress::-webkit-progress-value{background:linear-gradient(90deg,#9480ff,#6c55d8);border-radius:10px;transition:width .3s}progress::-moz-progress-bar{background:#7963e8;border-radius:10px}
-      #progress{white-space:pre-wrap;margin:9px 0 0;font-size:10px;line-height:1.6;color:#756b83}
-      .status-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.status-badge{display:inline-flex;align-items:center;gap:6px;color:#7d7b91;background:#f0eff5;border-radius:20px;padding:3px 9px;font-size:10px;font-weight:600}
-      .status-badge:before{content:"";width:5px;height:5px;border-radius:50%;background:#a09bac}.panel[data-state="running"] .status-badge{color:#158563;background:#e8f8f1}.panel[data-state="running"] .status-badge:before{background:#24ac80}.panel[data-state="starting"] .status-badge{color:#7864cd;background:#eee9ff}
-      .status-caption{font-size:10px;color:#aaa4b7}#status{margin:0 0 16px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.65;color:#777185;max-height:74px;overflow:auto}
-      .field{display:block;margin-bottom:13px}.field-name{display:block;font-size:11px;font-weight:650;color:#5a546c;margin-bottom:6px}
-      select{appearance:auto;width:100%;min-height:39px;padding:8px 10px;border:1px solid #e4e1ed;border-radius:10px;background:#fff;color:#514b65;font-size:12px}
-      select:disabled{color:#9d95aa;background:#f7f5fa}input[type="number"]{width:98px;min-height:36px;padding:6px 9px;border:1px solid #e3dfed;border-radius:10px;background:#fff;color:#504667;font-size:13px}
-      .delay-row{display:flex;align-items:center;justify-content:space-between;gap:12px}.delay-row .field-name{margin:0}.delay-control{display:flex;align-items:center;gap:8px;font-size:11px;color:#9790a4}
-      .hint{margin:7px 0 14px;color:#776f86;font-size:10px;line-height:1.65}
-      .course-strip{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:10px 11px;border-radius:11px;background:#f1f1f8;color:#8d87a0;font-size:10px}.course-strip svg{width:15px;height:15px;color:#a69cbe}#course-label{margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;color:#686176;font-size:11px}
-      details{border:1px solid #e9e6f1;border-radius:12px;background:#fff;margin-top:9px;overflow:hidden}summary{display:flex;align-items:center;gap:8px;list-style:none;padding:11px 12px;color:#686176;font-size:11px;font-weight:600;user-select:none}summary::-webkit-details-marker{display:none}summary>svg:first-child{width:16px;height:16px;color:#a49bb8}summary .chevron{margin-left:auto;width:15px;height:15px;color:#aaa3b6;transition:transform .15s}details[open] summary .chevron{transform:rotate(180deg)}details[open] summary{border-bottom:1px solid #efecf5}
-      .details-body{padding:12px}.details-body .field{margin-bottom:10px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}.actions button{font-size:11px;min-height:36px;padding:7px 8px}.actions .bank{background:#f0ecff;border-color:#e4dcff;color:#7560cc}.actions .danger{grid-column:1/-1;color:#be7569;border-color:#f2e4e1;background:#fffafa;font-size:10px}
-      #log-count{font-size:10px;font-weight:400;color:#b1aabb;margin-left:2px}pre{font:10px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace;margin:0;padding:11px 12px;max-height:144px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#faf9fe;color:#8f849f;min-height:42px}
-      .control-bar{padding:12px 18px 14px;border-top:1px solid #eae7f1;background:#fff;flex-shrink:0}.primary{width:100%;min-height:42px;border:0;background:linear-gradient(100deg,#8069f1,#6650d3);box-shadow:0 4px 12px #7963dd26;color:#fff;font-size:13px;font-weight:650}.primary:hover{background:linear-gradient(100deg,#735de6,#5d46c6);border:0}.primary:before{content:"";width:0;height:0;border-top:5px solid transparent;border-bottom:5px solid transparent;border-left:7px solid currentColor;margin-right:3px}.panel[data-state="running"] .primary:before,.panel[data-state="starting"] .primary:before{width:7px;height:10px;border:0;border-left:2px solid currentColor;border-right:2px solid currentColor}
-      .control-hint{display:block;text-align:center;margin-top:7px;font-size:9px;color:#b6afc1}
-      #orb{--orb-progress:0%;width:64px;height:64px;min-height:64px;border:0;border-radius:50%;padding:4px;display:grid;place-items:center;background:conic-gradient(#ad9dff var(--orb-progress),#7660df var(--orb-progress));box-shadow:0 8px 26px #6650c946,0 0 0 1px #ffffffb3;cursor:grab;touch-action:none;user-select:none;position:relative;transition:box-shadow .15s,filter .15s}
-      #orb:hover{box-shadow:0 10px 32px #6650c967;filter:brightness(1.05)}#orb:active{transform:none}.orb-inner{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;width:56px;height:56px;border-radius:50%;background:linear-gradient(150deg,#8a76f5,#6651d3);color:#fff;border:1px solid #ffffff55;pointer-events:none}.orb-inner svg{width:23px;height:23px}#orb-percent{font-size:9px;font-weight:650;line-height:1.2;color:#f2eeff}.orb-dot{position:absolute;right:0;bottom:1px;width:13px;height:13px;border:3px solid #fff;border-radius:50%;background:#b7afca;pointer-events:none}#orb[data-state="running"] .orb-dot{background:#29b887}#orb[data-state="starting"] .orb-dot{background:#f0b75c}
-      @media(prefers-reduced-motion:reduce){*{transition:none!important}}@media(max-height:600px){.usage-warning{font-size:10px;padding:8px 14px}.panel-header{padding:12px 14px}main{padding:12px 14px}.control-bar{padding:10px 14px}.control-hint{display:none}}
-      #help-toggle{width:30px;min-height:30px;padding:0;border-radius:50%;font-weight:750;color:#7560c5;background:#eee9ff;border:0;flex-shrink:0}#help-toggle[aria-expanded="true"]{background:#7560c5;color:white}
-      .tabs{display:flex;gap:5px;padding:9px 18px;background:#fff;border-bottom:1px solid #efecf5;flex-shrink:0}.tabs button{flex:1;border:0;min-height:33px;font-size:12px;color:#8a819b;background:transparent}.tabs button[aria-selected="true"]{background:#eee9ff;color:#6950bc;font-weight:700}
-      .quality-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.quality-grid>div{border:1px solid #eae6f4;border-radius:12px;padding:9px 3px;text-align:center;background:white}.quality-grid strong{display:block;color:#5e4a97;font-size:20px}.quality-grid span{color:#8e829e;font-size:10px}
-      .subtle{width:100%;margin:0 0 14px;color:#7560bc;background:#f6f3ff;border-style:dashed}.notice-box{margin:12px 0;padding:12px;border:1px solid #e7e2f5;background:#f6f3ff;border-radius:12px;font-size:11px;color:#766787;line-height:1.7}.notice-box p{margin:6px 0 10px}.notice-box strong{color:#5e4a83}.notice-box button{font-size:11px}
-      .bank-overview{padding:16px;border:1px solid #ddece6;background:linear-gradient(125deg,#eef9f4,#fbfffd);border-radius:16px;color:#4b806b}.bank-overview>span{font-size:11px}.bank-overview>strong{display:block;font-size:32px;line-height:1.5;letter-spacing:-1px}.bank-overview small{font-size:12px;font-weight:400}.bank-overview p{font-size:10px;margin:0;color:#6e9282}
-      .check-field{display:block;font-size:11px;color:#695c7e}.check-field input{vertical-align:middle;accent-color:#7560bc}.check-field small{display:block;font-size:10px;line-height:1.65;color:#8a8096;margin-top:5px}.help-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.help-heading small{font-size:10px;color:#9b90ad}.help-heading h2{font-size:17px;color:#4a3b64;margin:3px 0}.help-heading button{font-size:11px;min-height:32px;padding:5px 10px}
-      .help-body{padding:10px 13px;font-size:12px;color:#756881;line-height:1.85}.help-body ol{margin:0;padding-left:19px}.help-body li{margin:6px 0}.help-body p{margin:8px 0}.help-body details{margin:7px 0}.help-body details p{padding:0 11px 8px}.help-body summary{font-size:12px;padding:10px}.help-body summary:after{content:'+';margin-left:auto;color:#a695bf}.help-body details[open]>summary:after{content:'−'}.help-body pre{color:#756881;max-height:260px}#import-preview{margin:12px 0;padding:10px;background:#f6f3ff;border-radius:12px}#import-preview pre{margin-bottom:8px}
+      :host{all:initial;display:block;font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:#302b40}
+      *{box-sizing:border-box}[hidden]{display:none!important}button,input,select{font:inherit}button,summary{cursor:pointer}svg{width:20px;height:20px;flex-shrink:0}
+      button{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:42px;padding:9px 13px;border:1px solid #dcd7e9;border-radius:12px;background:#fff;color:#413651;transition:background .15s,box-shadow .15s}
+      button:hover{background:#f4f0ff;border-color:#b9a6ea}button:disabled{opacity:.48;cursor:not-allowed}button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #8d71da;outline-offset:3px}
+      .panel{width:min(420px,calc(100vw - 24px));height:min(780px,calc(100vh - 24px));height:min(780px,calc(100dvh - 24px));display:flex;flex-direction:column;overflow:hidden;border:1px solid #e8e2f2;border-radius:22px;background:#fff;box-shadow:0 16px 50px #30224326}
+      .panel-header{display:flex;gap:10px;align-items:center;padding:15px 16px;border-bottom:1px solid #eee9f5;cursor:grab;touch-action:none;user-select:none;background:#faf8ff}
+      :host([data-dragging="true"]) .panel-header,:host([data-dragging="true"]) #orb{cursor:grabbing}.brand-mark{display:grid;place-items:center;flex-shrink:0;width:36px;height:36px;background:#7050d4;color:#fff;border-radius:12px}.brand-mark svg{width:23px;height:23px}
+      .identity{flex:1;min-width:0}.identity h1{font-size:14px;font-weight:750;line-height:1.45;margin:0;letter-spacing:-.3px}.identity small{display:flex;flex-wrap:wrap;gap:7px;font-size:11px;color:#74677f;margin-top:4px}.version{color:#74677f}
+      #help-toggle,#fold{width:38px;min-height:42px;padding:0;flex-shrink:0;border:0;background:transparent;color:#69518b;font-weight:700;font-size:17px}#help-toggle[aria-expanded="true"]{background:#ece4ff;color:#5837b8}
+      .usage-warning{flex-shrink:0;padding:11px 18px;background:#fff6f2;border-bottom:1px solid #f4e4dc;color:#943e2c;font-size:12px;line-height:1.65}.usage-warning p{margin:4px 0 0;color:#8b5245}.usage-warning strong{font-weight:750}
+      .tabs{display:flex;gap:8px;padding:10px 18px;border-bottom:1px solid #eee9f5;flex-shrink:0;background:#fff}.tabs button{flex:1;border:0;min-height:40px;color:#70647d;background:transparent;font-weight:600}.tabs button[aria-selected="true"]{background:#efe8ff;color:#5e3dbb}
+      main{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:18px;scrollbar-width:thin;scrollbar-color:#d8cee9 transparent}
+      .course-strip{display:flex;align-items:center;gap:8px;margin:0 0 12px;color:#79658e}.course-strip svg{width:17px;height:17px}#course-label{font-size:14px;font-weight:600;color:#534563;margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .intro{font-size:14px;color:#63576e;margin:0 0 14px;line-height:1.65}.progress-card{padding:17px 18px;background:#f6f2ff;border-radius:16px;margin-bottom:16px}.progress-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px;font-weight:650;color:#584769}#progress-percent{font-size:12px;background:#e9defb;color:#604398;border-radius:14px;padding:2px 9px;white-space:nowrap}
+      #progress-empty strong{display:block;font-size:26px;line-height:1.4;font-weight:700;color:#3f2b62;margin:9px 0}.progress-metric{display:flex;align-items:baseline;gap:8px;margin:8px 0 12px}.progress-metric strong{font-size:38px;line-height:1.2;color:#432c6b;letter-spacing:-1px}.progress-metric span{color:#675574;font-size:14px}
+      progress{display:block;appearance:none;width:100%;height:7px;border:0;border-radius:8px;overflow:hidden;background:#e6dff0;accent-color:#7955d5}progress::-webkit-progress-bar{background:#e6dff0;border-radius:8px}progress::-webkit-progress-value{background:#7955d5;border-radius:8px}progress::-moz-progress-bar{background:#7955d5;border-radius:8px}#progress{font-size:13px;color:#675574;line-height:1.7;margin:9px 0 0;white-space:pre-wrap}
+      #refresh-progress{width:100%;margin-top:12px;min-height:42px;font-size:13px;font-weight:600;background:#fff}#refresh-note{margin:8px 0 0}
+      .status-row{display:flex;align-items:center;gap:8px;margin-bottom:7px}.status-badge{font-size:12px;font-weight:650;background:#efedf3;color:#665972;padding:3px 9px;border-radius:20px}.panel[data-state="running"] .status-badge{color:#12674b;background:#e6f5ed}.panel[data-state="starting"] .status-badge{background:#f2ebff;color:#6742b3}#status{font-size:13px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;max-height:70px;overflow:auto;margin:0 0 13px;color:#55485f}
+      .practice-tip{padding:0 0 12px}.practice-tip p{font-size:13px;color:#6b5d77;margin:0;line-height:1.7}.text-button{border:0;background:transparent;color:#6844bb;padding:5px 0;min-height:36px;justify-content:flex-start;text-align:left;font-size:13px}.text-button:hover{background:transparent;color:#452398;text-decoration:underline}
+      details{border-top:1px solid #e9e3f0;margin:0;background:#fff}summary{display:flex;align-items:center;gap:8px;list-style:none;min-height:46px;padding:11px 0;color:#574762;font-size:13px;font-weight:650;user-select:none}summary::-webkit-details-marker{display:none}summary .chevron{margin-left:auto;display:flex;align-items:center;color:#80708e}summary .chevron svg{width:16px;height:16px}details[open]>summary .chevron{transform:rotate(180deg)}.details-body{padding:0 0 15px}.field{display:block;margin-bottom:15px}.field-name{display:block;font-size:13px;color:#62526e;font-weight:600;margin-bottom:6px}
+      select{width:100%;min-height:42px;padding:9px 11px;border:1px solid #dcd4e6;border-radius:10px;background:#fff;color:#483957;font-size:14px}select:disabled{color:#8e8298;background:#f7f5fa}input[type="number"]{width:94px;min-height:40px;padding:7px 9px;border:1px solid #dcd4e6;border-radius:10px;color:#483957;background:#fff}.delay-row{display:flex;align-items:center;justify-content:space-between;gap:8px}.delay-row .field-name{margin:0}.delay-control{display:flex;align-items:center;gap:7px;font-size:12px;color:#73627f}.hint{font-size:12px;line-height:1.75;color:#756380;margin:9px 0 13px}.hint:empty{display:none}
+      .actions{display:grid;grid-template-columns:1fr 1fr;gap:9px}.actions button{font-size:13px;min-height:43px;padding:9px 8px}.bank{background:#f0eaff;border-color:#e2d5fb;color:#5f3daf;font-weight:650}.danger{color:#9d493f!important;background:#fff8f6!important;grid-column:1/-1}.quality-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.quality-grid strong{display:block;font-size:24px;color:#563e79}.quality-grid span{font-size:12px;color:#75637f}#log-count{font-size:12px;font-weight:400;color:#85728f;margin-left:auto}
+      pre{font:12px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;border-radius:10px;background:#f8f6fb;color:#695777;max-height:200px;overflow:auto;margin:0 0 12px}
+      .control-bar,.bank-control-bar{flex-shrink:0;padding:12px 18px;border-top:1px solid #e9e3f0;background:#fff}.primary{width:100%;min-height:46px;color:#fff;border:0;background:#7050cf;font-size:15px;font-weight:650;box-shadow:0 4px 12px #7050cf20}.primary:hover{background:#5d3aba}.control-hint{display:block;text-align:center;font-size:11px;color:#766382;margin-top:7px}
+      .bank-overview{padding:12px;background:#edf7f1;border-radius:15px;color:#28684c}.bank-overview>span{font-size:13px;font-weight:600}.bank-overview>strong{display:block;font-size:30px;line-height:1.2}.bank-overview small{font-size:14px;font-weight:400}.bank-overview p{font-size:13px;color:#4e7663;margin:0}.notice-box{padding:13px;border-radius:12px;background:#f6f1ff;color:#665075;margin:12px 0;font-size:13px;line-height:1.7}.notice-box p{margin:5px 0 9px}.notice-box strong{color:#503568}.notice-box.success{background:#edf8f0}.notice-box.success strong{color:#206444}#view-bank>.hint{margin:8px 0}.review-entry{border-top:1px solid #e9e3f0;margin-top:10px;padding-top:10px}.review-entry h2{font-size:16px;font-weight:700;margin:0 0 7px;color:#3f2e50}.review-entry>p{font-size:13px;color:#72617e;margin:0 0 8px;line-height:1.8}.subtle{width:100%;background:#f3eeff;color:#633eaf;border-color:#ddcff6;font-weight:600}.review-entry details{margin-top:12px}.check-field{display:block;font-size:13px;color:#5f4b70}.check-field input{accent-color:#7050cf;vertical-align:middle;width:16px;height:16px}.check-field small{display:block;font-size:12px;line-height:1.7;color:#756380;margin-top:6px}
+      .help-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.help-heading small{font-size:12px;color:#80708d}.help-heading h2{font-size:19px;margin:4px 0;color:#432f56}.help-heading button{font-size:13px}.help-body{font-size:14px;line-height:1.85;color:#665472;padding:0 0 15px}.help-body ol{margin:0;padding-left:21px}.help-body li{margin:8px 0}.help-body p{margin:10px 0}.help-body details{border:1px solid #e7e0ee;padding:0 12px;border-radius:10px;margin:8px 0}.help-body summary{font-size:13px}.help-body details p{font-size:13px}#import-preview{margin:14px 0;padding:12px;border-radius:12px;background:#f6f1ff}
+      #orb{--orb-progress:0%;width:64px;height:64px;min-height:64px;border:3px solid #e0d4fb;border-radius:50%;padding:0;background:#7050cf;color:white;box-shadow:0 6px 24px #58409038;cursor:grab;touch-action:none;user-select:none}#orb:hover{background:#5f3db9}.orb-inner{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:2px;pointer-events:none}.orb-inner svg{width:22px;height:22px}#orb-percent{font-size:10px;font-weight:650}.orb-dot{display:none}
+      @media(max-width:400px){.panel-header{padding:12px;gap:6px}.brand-mark{display:none}.identity h1{font-size:14px}.identity small{font-size:11px}.usage-warning{padding:10px 14px}main{padding:15px}.tabs{padding:9px 14px}.control-bar{padding:11px 14px}}
+      @media(max-height:600px){.panel-header{padding:10px 12px}.identity small{display:none}.usage-warning{padding:8px 14px;font-size:11px}.usage-warning p{display:none}.tabs{padding:6px 14px}.control-hint{display:none}main{padding:12px 14px}}
+      @media(prefers-reduced-motion:reduce){*{transition:none!important}}
     </style>
-    <section class="panel" id="assistant-panel" role="region" aria-label="知到智慧树掌握度满分助手 v1.8.1">
+    <style>
+      .bank-search{margin-bottom:12px}.bank-search>label{display:block;margin-bottom:6px;font-weight:650;color:#40334c}.bank-search>input{width:100%;box-sizing:border-box;border:1px solid #ddd0ea;border-radius:10px;padding:10px;font:inherit;color:inherit;background:#fff}.bank-search>input:focus-visible{outline:2px solid #7854ca;outline-offset:2px}.bank-search>.hint{margin:6px 0}.bank-search ul{list-style:none;padding:0;margin:0}.bank-search-card{border:1px solid #eee6f4;border-radius:12px;padding:10px 12px;margin:8px 0;overflow-wrap:anywhere}.bank-search-type{font-size:12px;color:#625077}.bank-search-card h3{font-size:14px;margin:3px 0 6px}.bank-search-card p{margin:5px 0 0;font-size:13px}.bank-search-verified{color:#246045}.bank-search-reference{color:#755421}#bank-search-more{margin-top:6px;width:100%}
+    </style>
+    <style>.bank-search .bank-search-options{list-style:disc;padding-left:20px;margin:0 0 6px;font-size:13px}</style>
+    <section class="panel" id="assistant-panel" role="region" aria-label="知到智慧树掌握度满分助手 v1.10.0">
       <header class="panel-header" id="drag-handle" title="拖动标题栏移动面板">
-        <div class="brand-mark">${bookIcon}</div><div class="identity"><h1>知到智慧树掌握度满分助手</h1><small>练习 · 复核 · 积累 <span class="version">v1.8.1</span></small></div>
+        <div class="brand-mark">${bookIcon}</div><div class="identity"><h1>知到智慧树掌握度满分助手</h1><small>自动练习，逐步积累题库 <span class="version">v1.10.0</span></small></div>
         <button id="help-toggle" type="button" aria-label="使用帮助" aria-controls="view-help" aria-expanded="false" title="使用帮助">?</button>
         <button id="fold" type="button" aria-label="收起为悬浮球" title="收起为悬浮球">${svg('<path d="M6 12h12"/>')}</button>
       </header>
       <aside class="usage-warning" role="note"><strong>警告：</strong>本脚本仅适用于智慧树掌握度练习 用于有答题次数限制的练习后果自负<p>脚本不会自动识别课程是否限制答题次数，请在启动前自行确认。</p></aside>
-      <nav class="tabs" role="tablist" aria-label="助手功能"><button id="tab-practice" role="tab" aria-selected="true" aria-controls="view-practice">练习</button><button id="tab-bank" role="tab" aria-selected="false" aria-controls="view-bank" tabindex="-1">题库</button></nav>
+      <nav class="tabs" role="tablist" aria-label="助手功能"><button id="tab-practice" role="tab" aria-selected="true" aria-controls="view-practice">开始练习</button><button id="tab-bank" role="tab" aria-selected="false" aria-controls="view-bank" tabindex="-1">我的题库</button></nav>
       <main>
         <section id="view-practice" role="tabpanel" aria-labelledby="tab-practice">
         <div class="course-strip">${bookIcon}<p id="course-label"></p></div>
-        <label class="field"><span class="field-name">运行模式</span><select id="activity" aria-label="运行模式"><option value="practice">满分练习</option><option value="bank">题库完善</option></select></label><p class="hint" id="mode-hint"></p>
-        <div class="progress-card"><div class="progress-heading"><span id="progress-title">已确认满分</span><span id="progress-percent">—</span></div><div class="progress-metric"><strong id="completed-count">—</strong><span>/ <span id="total-count">—</span> 个可练习知识点</span></div><progress id="progress-bar" aria-label="当前运行模式进度" max="1" value="0"></progress><p id="progress"></p></div>
-        <div id="review-stats" hidden><div class="quality-grid"><div><strong id="review-added">0</strong><span>新增确认</span></div><div><strong id="review-verified">0</strong><span>复核正确</span></div><div><strong id="review-corrected">0</strong><span>纠正答案</span></div><div><strong id="review-unresolved">0</strong><span>待解决</span></div></div><p class="hint" id="review-note"></p></div>
-        <button class="subtle" id="new-review" hidden>开始新一轮</button>
-        <div class="notice-box" id="review-reset" hidden><p>重新遍历全部非免考知识点？本轮进度和未处理答卷会重置，已有题库和答题记录保留。将采用设置中的“忽略已有答案”选项。</p><div class="actions"><button id="review-reset-confirm">确认新一轮</button><button id="review-reset-cancel">取消</button></div></div>
-        <div class="status-row"><span class="status-badge" id="run-state">已暂停</span><span class="status-caption">跟随页面实时反馈</span></div><p id="status" role="status" aria-live="polite"></p>
-        <details id="settings-details"><summary>运行设置<span class="chevron">${downIcon}</span></summary><div class="details-body">
+        <select id="activity" aria-label="运行模式" hidden><option value="practice">满分练习</option><option value="bank">题库完善</option></select>
+        <p id="practice-next" class="intro">自动完成尚未满分的知识点。</p>
+        <div class="progress-card"><div class="progress-heading"><span id="progress-title">本课程满分进度</span><span id="progress-percent">待检查</span></div><div id="progress-empty"><strong>准备开始</strong></div><div class="progress-metric" id="progress-numbers" hidden><strong id="completed-count">—</strong><span>/ <span id="total-count">—</span> 个知识点</span></div><progress id="progress-bar" aria-label="本课程满分进度" max="1" value="0" hidden></progress><p id="progress"></p><button id="refresh-progress">刷新进度</button><p class="hint" id="refresh-note">刷新会返回并重新载入热力图，核实最新进度，不会答题。</p></div>
+        <div class="status-row"><span class="status-badge" id="run-state">准备就绪</span></div><p id="status" role="status" aria-live="polite"></p>
+        <div class="practice-tip"><p id="practice-bank-hint"></p></div>
+        <details id="settings-details"><summary>练习设置<span class="chevron">${downIcon}</span></summary><div class="details-body">
         <label class="field"><span class="field-name">练习范围</span><select id="mode" aria-label="练习范围"><option value="all">全部知识点：仅跳过免考和100%</option><option value="current">当前知识点：本轮全对后停止</option></select></label>
         <label class="delay-row"><span class="field-name">操作间隔</span><span class="delay-control"><input id="delay" aria-label="操作间隔" type="number" min="0" max="10000" step="50"><span>毫秒</span></span></label>
         <p class="hint">操作间隔为选项切换、悬浮弹窗和页面更新提供响应时间，如流畅运行可尝试更低值</p>
-          <label class="field"><span class="field-name">题库匹配方式</span><select id="import-match" aria-label="题库匹配方式"><option value="loose">宽松匹配（默认）：相似题干与选项</option><option value="strict">严格匹配：题干与全部选项一致</option></select></label>
-          <label class="check-field" id="cold-setting" hidden><input id="ignore-answers" type="checkbox">忽略运行前已有答案（测试猜题能力）<small>仅对新一轮题库完善生效；保留原题库，本轮仍学习实际批改。正常完善题库无需勾选。</small></label>
+
         </div></details>
         <details id="log-details"><summary>${svg('<path d="M5 5h14M5 12h14M5 19h8"/>')}运行记录<span id="log-count">暂无记录</span><span class="chevron">${downIcon}</span></summary><pre id="log"></pre></details>
         </section>
         <section id="view-bank" role="tabpanel" aria-labelledby="tab-bank" hidden>
-          <label class="field"><span class="field-name">导入 / 导出课程</span><select id="export-course" aria-label="导入 / 导出课程"></select></label>
-          <div class="bank-overview"><span>可分享的确认题库</span><strong><span id="bank-count">0</span><small> 题</small></strong><p id="bank-quality"></p></div>
-          <p class="hint" id="bank-status" role="status" aria-live="polite"></p>
+          <label class="field"><span class="field-name">当前查看的题库</span><select id="export-course" aria-label="导入 / 导出课程"></select></label>
+          <section class="bank-search" aria-label="搜题">
+            <label for="bank-search">搜题</label>
+            <input id="bank-search" type="search" maxlength="500" placeholder="输入题干或选项关键词" autocomplete="off" aria-describedby="bank-search-help">
+            <p class="hint" id="bank-search-help">方便的搜索功能：让已导入或练习得到的题库发挥更大作用（见面课习题等可能会使用此处原题 在网上找答案前不妨在这里试试）</p>
+            <p class="hint" id="bank-search-status" role="status"></p>
+            <ul id="bank-search-results"></ul>
+            <button type="button" id="bank-search-more" hidden>查看更多题目</button>
+          </section>
+          <div class="bank-overview"><span>已验证，可导出</span><strong><span id="bank-count">0</span><small> 题</small></strong><p id="bank-quality"></p></div>
           <p class="hint" id="import-summary"></p>
-          <div class="actions"><button class="bank" id="import-bank">导入 TXT 题库</button><button class="bank" id="export-bank">导出纯文字题库</button></div>
+          <div class="actions"><button class="bank" id="import-bank">导入题库</button><button id="export-bank">导出已验证题库</button></div>
           <input id="import-file" type="file" accept=".txt,.json,text/plain,application/json" hidden>
-          <p class="hint">导入前先暂停。经网站判对的完整答案才能导出；导入候选不会直接混入分享文件。</p>
+          <p class="hint">推荐 TXT 格式，也支持本脚本的 JSON 记录。</p>
+          <div class="notice-box success" id="import-success" hidden><strong>题库已准备好</strong><p id="import-success-text"></p><button id="use-imported">返回练习页</button></div>
+          <p class="hint" id="bank-status" role="status" aria-live="polite"></p>
           <div id="import-preview" hidden><pre id="import-preview-text"></pre><div class="actions"><button class="bank" id="import-confirm">确认导入</button><button id="import-cancel">取消预览</button><button id="import-report">导出无法识别清单</button></div></div>
-          <div class="notice-box"><strong>让题库越用越完整</strong><p>在“练习”中选择“题库完善”，复核满分知识点并收集新题。完成后分享本课程的 TXT 文件。</p><button id="help-sharing">查看制作与分享方法</button></div>
-          <details id="export-details"><summary>更多数据操作<span class="chevron">${downIcon}</span></summary><div class="details-body"><div class="actions"><button id="export">导出记录 JSON</button><button id="export-excluded">导出未入库清单</button><button id="import-clear">清除导入题库</button><button class="danger" id="clear">清除当前课程记录</button></div>
+          <section class="review-entry"><h2 id="review-title">重新练习，补充题库</h2><p>已满分的也会重做，用于检查答案、收集新题。全部检查一遍后停止。</p><p class="hint" id="review-course-hint" hidden></p>
+          <div class="notice-box" id="review-progress" hidden><strong id="review-state">已暂停</strong><p id="review-progress-count"></p><progress id="review-progress-bar" aria-label="本轮题库补充进度" max="1" value="0"></progress></div>
+          <details id="review-stats" hidden><summary>本轮收集结果<span class="chevron">${downIcon}</span></summary><div class="details-body"><div class="quality-grid"><div><strong id="review-added">0</strong><span>新收录</span></div><div><strong id="review-verified">0</strong><span>再次验证正确</span></div><div><strong id="review-corrected">0</strong><span>已纠正</span></div><div><strong id="review-unresolved">0</strong><span>尚未答对</span></div></div><p class="hint" id="review-note"></p></div></details><button class="text-button" id="new-review" hidden>放弃本轮进度，重新开始</button>
+          <div class="notice-box" id="review-reset" hidden><strong>重新检查全部知识点？</strong><p>本轮进度和未处理答卷会重置，已存题库与答题记录保留。检查完一遍后自动停止。</p><div class="actions"><button id="review-reset-confirm">确认并开始</button><button id="review-reset-cancel">取消</button></div></div>
+          <details><summary>补充题库的高级设置<span class="chevron">${downIcon}</span></summary><div class="details-body"><label class="check-field" id="cold-setting"><input id="ignore-answers" type="checkbox">从头猜题，忽略已有答案<small>用于测试猜题能力，原题库会保留。仅在开始新一轮时生效；正常补充题库无需勾选。</small></label></div></details></section>
+          <details><summary>题库匹配设置<span class="chevron">${downIcon}</span></summary><div class="details-body"><label class="field"><span class="field-name">题库匹配方式</span><select id="import-match" aria-label="题库匹配方式"><option value="loose">宽松匹配（默认）：相似题干与选项</option><option value="strict">严格匹配：题干与全部选项一致</option></select></label></div></details>
+          <details><summary>题库操作记录<span class="chevron">${downIcon}</span></summary><pre id="bank-log"></pre></details>
+          <button class="text-button" id="help-sharing">如何制作和分享题库？</button>
+          <details id="export-details"><summary>备份与数据管理<span class="chevron">${downIcon}</span></summary><div class="details-body"><p class="hint" id="bank-issues"></p><div class="actions"><button id="export">备份答题记录 JSON</button><button id="export-excluded">查看未导出原因</button><button id="import-clear">清除导入题库</button><button class="danger" id="clear">清除所选课程记录</button></div>
           <div id="import-clear-preview" hidden><p class="hint" id="import-clear-text"></p><div class="actions"><button class="danger" id="import-clear-confirm">确认清除导入库</button><button id="import-clear-cancel">取消清除</button></div></div>
-          <p class="hint">JSON 导入也通过“导入 TXT 题库”选择文件。清除当前课程记录针对正在浏览的课程；清除导入题库针对上方所选课程。</p></div></details>
+          <p class="hint">JSON 导入也通过“导入题库”选择文件。本区所有导入、导出与清理操作，都针对上方所选课程。</p></div></details>
         </section>
         <section id="view-help" role="region" aria-label="使用帮助" hidden>
           <div class="help-heading"><div><small>使用指南</small><h2>从练习到分享题库</h2></div><button id="help-back" aria-label="返回原页面">返回</button></div>
           <p class="notice-box" id="help-context"></p>
-          <details open><summary>01　第一次使用<span class="chevron">${downIcon}</span></summary><div class="help-body"><ol><li>进入课程的掌握度热力图，确认答题次数不限。</li><li>选择“满分练习”，点击“开始 / 继续”。脚本跳过免考和已确认 100% 的知识点。</li><li>需要时点击“暂停”。收起成悬浮球仍会运行，拖动标题栏或球可以移动。</li></ol><p>“运行设置”中可调整操作间隔，默认 100 毫秒。如出现选择未生效或页面响应不及时，可以调高间隔。</p></div></details>
-          <details><summary>02　使用别人的题库<span class="chevron">${downIcon}</span></summary><div class="help-body"><ol><li>暂停运行，在“题库”页选择对应课程。</li><li>点击“导入 TXT 题库”，选择文件并核对预览，再点“确认导入”。</li><li>回到“练习”开始作答。已确认答案优先，导入候选其次，最后按组合猜题。</li></ol><p>默认宽松匹配：题型一致、题干相似度至少 80%，选项模糊对应至少 85%，且对应唯一。严格匹配要求题干与全部选项内容一致。选项字母和顺序不影响匹配，可在运行设置中切换。</p><p>TXT 兼容本脚本导出的格式，也支持本脚本 JSON 记录。无法识别的条目可导出原因清单；重复导入会合并去重。</p></div></details>
-          <details id="help-make"><summary>03　制作与分享题库<span class="chevron">${downIcon}</span></summary><div class="help-body"><ol><li>打开课程热力图，选择“题库完善”。可以先导入别人分享的题库，减少猜题轮数。</li><li>点击开始。即使已满分也会实际答题，每个知识点全对后继续，本轮遍历完成便停止。</li><li>查看新增、复核、纠错和待解决统计。需要收集更多随机题时，暂停后点击“开始新一轮”。</li><li>在“题库”页选择本课程，点击“导出纯文字题库”。仅导出网站判对、内容完整且无冲突的题目。</li><li>分享 TXT 文件，并注明课程名称、学校或授课教师、导出日期和题目数量。不必分享运行记录。</li></ol><p>分享前检查内容和图片链接是否适合公开，并确认你有权分享。题库仅保存在本机，脚本不会替你上传。</p><p>若自己整理 TXT，可照下面格式写。多选答案用分号分隔，判断题用 true / false：</p><pre>1.【单选题】哪种图形有三条边？
+          <details open><summary>01　第一次使用<span class="chevron">${downIcon}</span></summary><div class="help-body"><ol><li>进入课程的掌握度热力图，确认答题次数不限。</li><li>在“开始练习”页点击底部的“开始练习”。不需要先准备题库，脚本会自动跳过免考和满分项。</li><li>需要时点击“暂停练习”。手动作答后，可点“刷新进度”：脚本会返回并重新载入热力图，逐一核实最新百分比，只更新进度，不会答题。收起成悬浮球仍会运行，拖动标题栏或球可以移动。</li></ol><p>“练习设置”中可调整操作间隔，默认 100 毫秒。如出现选择未生效或页面响应不及时，可以调高间隔。</p></div></details>
+          <details><summary>02　使用别人的题库<span class="chevron">${downIcon}</span></summary><div class="help-body"><ol><li>暂停运行，在“我的题库”中选择对应课程。</li><li>点击“导入题库”，选择 TXT 文件，核对课程和题目预览后点击“确认导入”。</li><li>导入成功后点击“返回练习页”，再点击“开始练习”或“继续练习”。已做对的答案优先，导入答案其次，没有可用答案时继续猜题。</li></ol><p>默认宽松匹配：题型一致、题干相似度至少 80%，选项模糊对应至少 85%，且对应唯一。严格匹配要求题干与全部选项内容一致。选项字母和顺序不影响匹配，可在“我的题库 → 题库匹配设置”中切换。</p><p>TXT 兼容本脚本导出的格式，也支持本脚本 JSON 记录。无法识别的条目可导出原因清单；重复导入会合并去重。</p></div></details>
+          <details id="help-make"><summary>03　制作与分享题库<span class="chevron">${downIcon}</span></summary><div class="help-body"><ol><li>打开课程热力图，在“我的题库”中找到“重新练习，补充题库”。可以先导入别人分享的题库。</li><li>点击“开始补充题库”。已满分的也会重做，每个知识点全对后继续，全部检查一遍后停止。</li><li>在“我的题库”中查看本轮进度、暂停或继续，并展开“本轮收集结果”查看新收录和纠正的题目。本轮完成后，可在“我的题库”中点击“再检查一轮”。</li><li>在“我的题库”中选择本课程，点击“导出已验证题库”。只有网站判对、内容完整且无冲突的题目才会导出。</li><li>分享 TXT 文件，并注明课程名称、学校或授课教师、导出日期和题目数量。不必分享运行记录。</li></ol><p>分享前检查内容和图片链接是否适合公开，并确认你有权分享。题库仅保存在本机，脚本不会替你上传。</p><p>若自己整理 TXT，可照下面格式写。多选答案用分号分隔，判断题用 true / false：</p><pre>1.【单选题】哪种图形有三条边？
 A.圆形
 B.三角形
 三角形
@@ -1405,18 +1654,19 @@ C.4
 3.【判断题】三角形有三条边。
 true</pre></div></details>
           <details id="help-faq"><summary>04　常见问题<span class="chevron">${downIcon}</span></summary><div class="help-body">
-            <details><summary>为什么已经满分还会练习？</summary><p>题库完善会忽略网站已有满分，以实际提交来复核和补题。满分练习只跳过确认 100% 的项；绿色也可能只有 80% 或 90%。</p></details>
+            <details><summary>为什么已经满分还会练习？</summary><p>“补充题库”会重做满分知识点，用于检查答案、收集新题。普通练习只跳过确认 100% 的项；绿色也可能只有 80% 或 90%。</p></details>
             <details><summary>一轮结束，题库就完整了吗？</summary><p>不一定。网站可能随机抽题，一轮只覆盖本次实际出现的题目。可以开始新一轮继续收集，不会无限自动循环。</p></details>
             <details><summary>错误题库会反复选错吗？</summary><p>不会持续沿用同一已判错组合。脚本根据网站批改撤销错误确认，排除错误候选并继续猜题。完全相同题目跨知识点的旧记录也会修正。宽松匹配仍可能增加试错次数。</p></details>
-            <details><summary>新增、复核、纠错分别是什么意思？</summary><p><strong>新增确认：</strong>之前没有记住这道题的正确答案，这一轮做对了，已存入题库。</p><p><strong>复核正确：</strong>题库里原来就有正确答案，这一轮再次作答，网站仍然判对。</p><p><strong>纠正答案：</strong>原来保存或导入的答案被判错，脚本重新尝试后找到了正确答案。</p><p><strong>待解决：</strong>这一轮已经遇到，但还没有做对的题目。</p><p>这些数字只统计本轮，同一道题反复作答不会重复计数。如果一道新题的导入答案有误，修正后会同时计入“新增确认”和“纠正答案”。</p></details>
+            <details><summary>本轮收集结果里的数字是什么意思？</summary><p><strong>新收录：</strong>之前没有记住这道题的正确答案，这一轮做对了，已存入题库。</p><p><strong>再次验证正确：</strong>题库里原来就有正确答案，这一轮再次作答，网站仍然判对。</p><p><strong>已纠正：</strong>原来保存或导入的答案被判错，脚本重新尝试后找到了正确答案。</p><p><strong>尚未答对：</strong>这一轮已经遇到，但还没有做对的题目。</p><p>这些数字只统计本轮，同一道题反复作答不会重复计数。如果一道新题的导入答案有误，修正后会同时计入“新收录”和“已纠正”。</p></details>
             <details><summary>刷新、更新或清除会影响数据吗？</summary><p>题库和完善轮次保存在当前浏览器的脚本存储中，刷新不清空。运行时同一标签页刷新可续跑，暂停后需手动继续。更新原脚本条目的代码保留数据；删除脚本或扩展数据可能丢失记录，请先导出。面板日志仅保留本页面最近 150 条，显示最近 12 条。</p></details>
-            <details><summary>导出为什么比导入少？</summary><p><strong>导入：</strong>把文件里的答案存进来，供脚本答题时尝试。这时还不知道答案是否正确。</p><p><strong>导出：</strong>只分享已经在网站上做对、题目和选项记录完整，而且没有答案冲突的题目。</p><p>例如，导入了 100 道题，这次遇到并做对了 60 道，另外 40 道还没遇到。那么，这批导入题中只有前 60 道可以导出；原来题库中符合条件的其他题目也会一起导出。</p><p>还没遇到的题，可以用“题库完善”模式继续练习、验证。网站可能随机出题，一轮不一定能遇到所有题。</p><p>已经做过却未导出的题，到“题库 → 更多数据操作 → 导出未入库清单”查看原因，例如答案尚未确认、选项缺失或答案冲突。</p></details>
+            <details><summary>导出为什么比导入少？</summary><p><strong>导入：</strong>把文件里的答案存进来，供脚本答题时尝试。这时还不知道答案是否正确。</p><p><strong>导出：</strong>只分享已经在网站上做对、题目和选项记录完整，而且没有答案冲突的题目。</p><p>例如，导入了 100 道题，这次遇到并做对了 60 道，另外 40 道还没遇到。那么，这批导入题中只有前 60 道可以导出；原来题库中符合条件的其他题目也会一起导出。</p><p>还没遇到的题，可以在“我的题库”中点击“开始补充题库”，继续练习、验证。网站可能随机出题，一轮不一定能遇到所有题。</p><p>已经做过却未导出的题，到“我的题库 → 备份与数据管理 → 查看未导出原因”查看原因，例如答案尚未确认、选项缺失或答案冲突。</p></details>
             <details><summary>“忽略已有答案”会删掉题库吗？</summary><p>不会。它让新一轮从猜题开始，忽略运行前已有确认、排除记录和导入候选，只学习本轮反馈；新结果仍保存。正常完善题库建议不勾选。本轮开始后固定此设置，下一轮才可更改。</p></details>
             <details><summary>脚本卡住或出现异常弹窗怎么办？</summary><p>先暂停，手动处理网站提示并检查是否有其他自动答题脚本干扰。可以调高操作间隔再继续。持续失败时保存版本、页面类型和最后提示；公开截图前遮住个人信息。</p></details>
           </div></details>
         </section>
       </main>
-      <footer class="control-bar"><button class="primary" id="start">开始 / 继续</button><small class="control-hint">拖动标题栏移动 · 收起后继续运行</small></footer>
+      <footer class="control-bar"><button class="primary" id="start">开始练习</button><small class="control-hint">仅在确认答题次数不限后使用</small></footer>
+      <footer class="bank-control-bar" id="bank-controls" hidden><button class="primary" id="begin-review">开始补充题库</button><small class="control-hint">已满分的也会重做，一轮完成后自动停止</small><small class="control-hint">不建议重刷次数过多 不确定是否会触发网站警告</small></footer>
     </section>
     <button id="orb" type="button" aria-label="展开掌握度满分助手" aria-controls="assistant-panel" aria-expanded="false" title="点击展开，拖动移动。仅用于不限次数的掌握度练习。" hidden><span class="orb-inner">${bookIcon}<span id="orb-percent">掌握度</span></span><span class="orb-dot"></span></button>`;
     uiStatus = $('#status', ui); uiLog = $('#log', ui); uiStart = $('#start', ui);
@@ -1440,22 +1690,25 @@ true</pre></div></details>
         showTab(name); $('#tab-' + name, ui).focus();
       }
     });
-    $('#activity', ui).onchange = () => {
-      if (running || starting || busy || importBusy) return;
-      settings.activity = $('#activity', ui).value;
-      GM_setValue(SETTINGS, settings); candidateCache.clear();
-      resetReviewRequested = false; $('#review-reset', ui).hidden = true;
-      refreshProgress(); render();
+    $('#activity', ui).onchange = () => selectActivity($('#activity', ui).value);
+    $('#refresh-progress', ui).onclick = () => refreshMasteryProgress();
+    $('#begin-review', ui).onclick = beginReview;
+    $('#use-imported', ui).onclick = () => {
+      showTab('practice');
     };
     $('#ignore-answers', ui).onchange = () => { settings.ignoreAnswers = $('#ignore-answers', ui).checked; GM_setValue(SETTINGS, settings); };
-    $('#new-review', ui).onclick = () => { resetReviewRequested = courseId(); $('#review-reset', ui).hidden = false; };
+    $('#new-review', ui).onclick = () => {
+      if (running || starting || busy || importBusy || uiExportCourse.value !== courseId()) return;
+      resetReviewRequested = courseId(); $('#review-reset', ui).hidden = false;
+      $('#review-reset', ui).scrollIntoView({ block: 'nearest' });
+    };
     $('#review-reset-cancel', ui).onclick = () => { resetReviewRequested = false; $('#review-reset', ui).hidden = true; };
     $('#review-reset-confirm', ui).onclick = resetReview;
-    uiStart.onclick = () => running || starting ? stop() : start();
+    uiStart.onclick = beginPractice;
     const changeSettings = () => {
       const delay = Number(uiDelay.value);
       if (!uiDelay.value.trim() || !Number.isFinite(delay) || delay < 0 || delay > 10000) { uiDelay.value = settings.delay; return; }
-      settings = { ...settings, mode: improving() ? settings.mode : uiMode.value, delay };
+      settings = { ...settings, mode: uiMode.value, delay };
       GM_setValue(SETTINGS, settings);
     };
     uiMode.onchange = uiDelay.onchange = changeSettings;
@@ -1468,12 +1721,15 @@ true</pre></div></details>
       candidateCache.clear(); GM_setValue(SETTINGS, settings);
     };
     uiExportCourse.onchange = () => {
+      bankSearchLimit = 8;
       stagedImport = null; $('#import-preview', ui).hidden = true;
       importClearCourse = ''; $('#import-clear-preview', ui).hidden = true;
       refreshImportSummary(); render();
     };
+    $('#bank-search', ui).oninput = () => { bankSearchLimit = 8; refreshImportSummary(); };
+    $('#bank-search-more', ui).onclick = () => { bankSearchLimit += 8; refreshImportSummary(); };
     $('#import-bank', ui).onclick = () => {
-      if (running || starting || busy || importBusy) { log('请先暂停后导入题库'); return; }
+      if (running || starting || busy || importBusy) { logBank('请先暂停后导入题库'); return; }
       $('#import-file', ui).value = ''; $('#import-file', ui).click();
     };
     $('#import-file', ui).onchange = event => {
@@ -1482,9 +1738,9 @@ true</pre></div></details>
     };
     $('#import-confirm', ui).onclick = () => changeImportedBank();
     $('#import-clear', ui).onclick = () => {
-      if (running || starting || busy || importBusy) { log('请先暂停后清除导入题库'); return; }
+      if (running || starting || busy || importBusy) { logBank('请先暂停后清除导入题库'); return; }
       const id = uiExportCourse.value || courseId();
-      if (!id) { log('请先选择课程'); return; }
+      if (!id) { logBank('请先选择课程'); return; }
       importClearCourse = id;
       const course = GM_getValue(COURSES, {})[id] || { id, name: '' };
       $('#import-clear-text', ui).textContent = `确认清除“${course.name || id}”的导入候选？已确认答案和尝试记录保留，其他课程不受影响。`;
@@ -1503,47 +1759,45 @@ true</pre></div></details>
         const source = exportSource(), at = new Date().toISOString();
         download(courseFileName('智慧树练习记录', source.course, at) + '.json', JSON.stringify({ version: 1, course: source.course, exportedAt: at,
           records: source.records, logs: courseLogs[source.course.id] || [], logScope: 'current_tab_page_session_for_selected_course' }, null, 2));
-      } catch (error) { log(error.message); }
+      } catch (error) { logBank(error.message); }
     };
     $('#export-bank', ui).onclick = () => {
       try {
         const source = exportSource();
         const bank = formatTextBank(questionBankFromRecords(source.records.questions));
-        if (!bank.exported) { log('尚无可导出的确认答案，未解题继续保存在运行记录中'); return; }
+        if (!bank.exported) { logBank('尚无可导出的确认答案，未解题继续保存在运行记录中'); return; }
         download(courseFileName('智慧树纯文字题库', source.course, new Date().toISOString()) + '.txt', '\uFEFF' + bank.text, 'text/plain;charset=utf-8');
-        log(`[${source.course.name || source.course.id}] 已入库并导出 ${bank.exported} 题；另有未确认答案 ${bank.unconfirmed} 题、数据异常 ${bank.incomplete} 题未写入题库，答案冲突 ${bank.conflicts} 组。可点击“导出未入库清单”查看`, source.course.id);
-      } catch (error) { log(error.message); }
+        logBank(`[${source.course.name || source.course.id}] 已入库并导出 ${bank.exported} 题；另有未确认答案 ${bank.unconfirmed} 题、数据异常 ${bank.incomplete} 题未写入题库，答案冲突 ${bank.conflicts} 组。可点击“导出未入库清单”查看`, source.course.id);
+      } catch (error) { logBank(error.message); }
     };
     $('#export-excluded', ui).onclick = () => {
       try {
         const source = exportSource();
         const bank = formatTextBank(questionBankFromRecords(source.records.questions));
-        if (!bank.excluded.length) { log(`[${source.course.name || source.course.id}] 已收集题目均可入库，没有未入库题目`, source.course.id); return; }
+        if (!bank.excluded.length) { logBank(`[${source.course.name || source.course.id}] 已收集题目均可入库，没有未入库题目`, source.course.id); return; }
         download(courseFileName('智慧树未入库题目', source.course, new Date().toISOString()) + '.txt', '\uFEFF' + formatExcludedBankReport(bank), 'text/plain;charset=utf-8');
-        log(`[${source.course.name || source.course.id}] 已导出未入库清单 ${bank.excluded.length} 项，包含题干、选项、知识点和未入库原因`, source.course.id);
-      } catch (error) { log(error.message); }
+        logBank(`[${source.course.name || source.course.id}] 已导出未入库清单 ${bank.excluded.length} 项，包含题干、选项、知识点和未入库原因`, source.course.id);
+      } catch (error) { logBank(error.message); }
     };
-    $('#clear', ui).onclick = () => {
-      if (running || starting || busy || importBusy) { log('请先暂停后清除记录'); return; }
-      if (!courseId() || !confirm(`清除当前页面课程 ${GM_getValue(COURSES, {})[courseId()]?.name || courseId()} 的本地答案和尝试记录？网站成绩不会被修改，其他课程记录保留。`)) return;
-      dbCourse = courseId(); db = { version: 1, questions: {}, rounds: {}, pending: null };
-      // 清除所有课程记录也删除导入库；避免 save() 的跨页面合并重新带回旧导入项。
-      db.imported = []; db.importRevision = (Number(GM_getValue(PREFIX + dbCourse, null)?.importRevision) || 0) + 1;
-      GM_setValue(PREFIX + dbCourse, db); candidateCache.clear();
-      stagedImport = null; $('#import-preview', ui).hidden = true;
-      importClearCourse = ''; $('#import-clear-preview', ui).hidden = true;
-      loadMasteryChecks(dbCourse); checks = { version: 1, entries: {} }; saveMasteryChecks(); refreshImportSummary(); refreshProgress(); log('本课程本地记录与导入题库已清除');
-    };
+    $('#clear', ui).onclick = clearSelectedCourse;
     refreshProgress(); render();
   }
   discoverCourses();
   setupUI();
-  GM_registerMenuCommand('开始 / 继续掌握度练习', start);
+  GM_registerMenuCommand('开始 / 继续掌握度练习', beginPractice);
+  GM_registerMenuCommand('刷新掌握度进度（暂停后）', () => refreshMasteryProgress());
   GM_registerMenuCommand('暂停掌握度练习', () => stop());
   setInterval(step, 350);
   setInterval(refreshProgress, 1000);
   addEventListener('pagehide', () => { if (releaseLock) releaseLock(); });
   try {
+    const refreshRequest = JSON.parse(sessionStorage.getItem(PROGRESS_REFRESH) || 'null');
+    sessionStorage.removeItem(PROGRESS_REFRESH);
+    if (refreshRequest?.course === courseId() && Date.now() - refreshRequest.at < 300000) {
+      sessionStorage.removeItem(SESSION);
+      refreshMasteryProgress(false);
+      return;
+    }
     const previous = JSON.parse(sessionStorage.getItem(SESSION) || 'null');
     if (previous?.course === courseId()) {
       if (['practice', 'bank'].includes(previous.activity)) settings.activity = previous.activity;
